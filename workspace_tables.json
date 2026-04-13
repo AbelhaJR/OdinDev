@@ -1,0 +1,223 @@
+{
+  "alerts_and_incidents": [
+    "SecurityAlert",
+    "SecurityIncident",
+    "AlertEvidence",
+    "AlertInfo",
+    "Alerts_data_Checkpoint_CL",
+    "Alerts_data_Statistics_Company_Checkpoint_CL",
+    "SOCRadar_Alarms_CL",
+    "SOC_Radar_CL"
+  ],
+
+  "identity_and_authentication": [
+    "SigninLogs",
+    "AADManagedIdentitySignInLogs",
+    "AADServicePrincipalSignInLogs",
+    "AADProvisioningLogs",
+    "AADRiskyUsers",
+    "AADUserRiskEvents",
+    "IdentityLogonEvents",
+    "IdentityDirectoryEvents",
+    "IdentityInfo",
+    "IdentityQueryEvents",
+    "MicrosoftServicePrincipalSignInLogs"
+  ],
+
+  "endpoint_microsoft_defender": [
+    "DeviceEvents",
+    "DeviceProcessEvents",
+    "DeviceNetworkEvents",
+    "DeviceLogonEvents",
+    "DeviceFileEvents",
+    "DeviceRegistryEvents",
+    "DeviceInfo",
+    "DeviceNetworkInfo",
+    "DeviceCustomScriptEvents"
+  ],
+
+  "windows_servers": [
+    "WindowsBorsa_CL",
+    "WindowsCWC_CL",
+    "WindowsClearing_CL",
+    "WindowsDenmark_CL",
+    "WindowsESOslo_CL",
+    "WindowsEuronext_CL",
+    "WindowsInterbolsa_CL",
+    "WindowsMTS_CL",
+    "WindowsOsloBors_CL"
+  ],
+
+  "linux_servers": [
+    "LinuxAcupay_CL",
+    "LinuxAdminControl_CL",
+    "LinuxClearing_CL",
+    "LinuxDenmark_CL",
+    "LinuxESOslo_CL",
+    "LinuxEuronext_CL",
+    "LinuxEuronextFX_CL",
+    "LinuxInterbolsa_CL",
+    "LinuxMTS_CL",
+    "LinuxOsloBors_CL"
+  ],
+
+  "network_security_devices": [
+    "CiscoBorsa_CL",
+    "CiscoClearing_CL",
+    "CiscoESOslo_CL",
+    "CiscoEuronext_CL",
+    "CiscoInterbolsa_CL",
+    "CiscoISEESOslo_CL",
+    "CiscoISEEuronext_CL",
+    "CiscoAsaVpnClearing_CL",
+    "FortinetBorsa_CL",
+    "FortinetEuronext_CL",
+    "CheckpointEuronext_CL",
+    "PaloAltoClearing_CL",
+    "PaloAltoDenmark_CL",
+    "FirepowerESOslo_CL",
+    "FirepowerEuronext_CL",
+    "JuniperEuronext_CL",
+    "BigIPESOslo_CL",
+    "F5Mts_CL",
+    "NetscalerEuronext_CL",
+    "RiverbedEuronext_CL"
+  ],
+
+  "network_and_proxy": [
+    "ZscalerEuronext_CL",
+    "ProxyInterbolsa_CL",
+    "Cloudflare_Nofications_CL",
+    "PulseSecureEuronext_CL"
+  ],
+
+  "dns_and_ip_management": [
+    "InfobloxEuronext_CL",
+    "BloxoneEuronext_CL"
+  ],
+
+  "email_and_m365": [
+    "OfficeActivity",
+    "EmailEvents",
+    "EmailAttachmentInfo",
+    "EmailUrlInfo",
+    "EmailPostDeliveryEvents",
+    "UrlClickEvents"
+  ],
+
+  "cloud_and_azure": [
+    "AzureActivity",
+    "AzureDiagnostics",
+    "AzureMetrics",
+    "StorageBlobLogs",
+    "StorageFileLogs",
+    "StorageQueueLogs",
+    "StorageTableLogs",
+    "MicrosoftGraphActivityLogs",
+    "PowerAutomateActivity"
+  ],
+
+  "virtualization": [
+    "VMwareBita_CL",
+    "VMwareClearing_CL",
+    "VMwareDenmark_CL",
+    "VMwareESOslo_CL",
+    "VMwareEuronext_CL",
+    "VMwareOsloBors_CL"
+  ],
+
+  "application_and_platform_logs": [
+    "AppAvailabilityResults",
+    "AppExceptions",
+    "AppMetrics",
+    "AppPerformanceCounters",
+    "AppRequests",
+    "AppServiceHTTPLogs",
+    "AppTraces",
+    "FunctionAppLogs",
+    "Operation"
+  ],
+
+  "security_and_behavior_analytics": [
+    "BehaviorAnalytics",
+    "UserPeerAnalytics",
+    "Anomalies",
+    "ThreatIntelIndicators",
+    "ThreatIntelObjects",
+    "SecurityAttackPathData"
+  ],
+
+  "cmdb_and_asset_context": [
+    "COVERAGE_CMDB"
+  ],
+
+  "backup_and_recovery": [
+    "VEEAMDenmark_CL",
+    "NetBackupEuronext_CL"
+  ],
+
+  "identity_governance_and_pam": [
+    "CyberArkEuronext_CL",
+    "SailpointEuronext_CL"
+  ],
+
+  "vulnerability_and_risk_intelligence": [
+    "BitsightBreaches_data_CL",
+    "BitsightBreaches_data_Checkpoint_CL",
+    "BitsightBreaches_data_Company_Checkpoint_CL",
+    "BitsightCompany_details_CL",
+    "BitsightCompany_details_Checkpoint_CL",
+    "BitsightCompany_details_Company_Checkpoint_CL",
+    "BitsightCompany_rating_details_CL",
+    "BitsightCompany_rating_details_Checkpoint_CL",
+    "BitsightDiligence_historical_statistics_CL",
+    "BitsightDiligence_historical_statistics_Checkpoint_CL",
+    "BitsightDiligence_statistics_CL",
+    "BitsightDiligence_statistics_Checkpoint_CL",
+    "BitsightFindings_data_CL",
+    "BitsightFindings_data_Checkpoint_CL",
+    "BitsightFindings_data_Company_Checkpoint_CL",
+    "BitsightFindings_summary_CL",
+    "BitsightFindings_summary_Checkpoint_CL",
+    "BitsightFindings_summary_Company_Checkpoint_CL",
+    "BitsightGraph_data_CL",
+    "BitsightGraph_data_Checkpoint_CL",
+    "BitsightIndustrial_statistics_CL",
+    "BitsightIndustrial_statistics_Checkpoint_CL",
+    "BitsightObservation_statistics_Checkpoint_CL"
+  ],
+
+  "threat_intelligence_and_external_feeds": [
+    "misp_validator_CL",
+    "SOCRadarAuditLog_CL"
+  ],
+
+  "monitoring_and_health": [
+    "Heartbeat",
+    "SentinelHealth",
+    "SentinelAudit",
+    "HealthMonitor_CL",
+    "LAQueryLogs",
+    "DCRLogErrors"
+  ],
+
+  "other_custom_sources": [
+    "AWSGuardDuty_CL",
+    "AristaEuronextFX_CL",
+    "AristaMTS_CL",
+    "GraylogINC_CL",
+    "JiraEuronext_CL",
+    "IronPortEuronext_CL",
+    "HPECWC_CL",
+    "IBMClearing_CL",
+    "MainframeCPH_CL",
+    "MainframeInterbolsa_CL",
+    "MSSQLClearing_CL",
+    "RedHatInsights_CL",
+    "RedHatACSEuronext_CL",
+    "UnifyCWC_CL",
+    "Metrics_CL",
+    "Usage",
+    "coralogix_aws_alerts_CL"
+  ]
+}

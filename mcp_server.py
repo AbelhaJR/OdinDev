@@ -12,14 +12,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 
-# ── Application Insights telemetry ────────────────────────────────────────────
-try:
-    from applicationinsights import TelemetryClient
-    _APPINSIGHTS_KEY = os.environ.get("APPINSIGHTS_INSTRUMENTATIONKEY") or os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING")
-    _telemetry_client: Optional[TelemetryClient] = TelemetryClient(_APPINSIGHTS_KEY) if _APPINSIGHTS_KEY else None
-except ImportError:
-    _telemetry_client = None
-
 # ============================================================
 # MCP SETUP
 # ============================================================
@@ -1975,16 +1967,15 @@ SecurityAlert
 _register_tool_def(
     "run_investigation_checklist",
     (
-        "Executes the full mandatory investigation checklist for a Sentinel incident in a SINGLE call. "
-        "Runs all telemetry queries in parallel server-side and returns one consolidated evidence package. "
-        "Use this instead of calling investigate_incident + run_query + analyze_entity individually — "
-        "it avoids context window exhaustion from multiple sequential tool calls. "
-        "Supported checklists: execution, identity, lateral_movement, network, malware, cloud, behavioral, default. "
-        "Pass checklist='auto' to auto-detect from incident alert names. "
-        "Returns structured evidence buckets: incident_meta, similar_history, cmdb, process_events, "
-        "network_events, file_events, registry_events, device_events, security_alerts_30d, "
-        "behavior_analytics, signin_logs, entity_analysis, site_logs. "
-        "Each bucket contains: status (ok/partial/error/skipped), rows_returned, summary, raw_data."
+        "Executes a parallel server-side batch of telemetry queries for an incident and returns "
+        "compact bucket summaries. Does NOT replace get_incident_report (use that for incident "
+        "metadata and the authoritative entity list) or per-entity deep dives via run_query and "
+        "analyze_entity. This tool is a fan-out helper: it runs 8-12 queries server-side and "
+        "returns small row-count summaries so the agent can decide where to dig deeper. "
+        "Buckets returned: process_events, network_events, file_events, registry_events, "
+        "device_events, security_alerts_30d, behavior_analytics, signin_logs, entity_analysis, "
+        "site_logs. Each bucket: status (ok/ok_empty/error/skipped), rows, summary string, up to "
+        "3 truncated sample rows. Call get_incident_report first for the canonical incident view."
     ),
     {
         "incident_id":  "Sentinel incident number",
@@ -2185,16 +2176,31 @@ def _summarise_bucket(bucket_id: str, res: dict) -> dict:
     count = len(rows)
     status = "ok" if count > 0 else "ok_empty"
 
-    # Build a compact field-value summary (top 5 rows, key fields only)
+    # Build a compact field-value summary. Cap row count, field count, and
+    # value length aggressively to keep checklist response size bounded.
+    MAX_SAMPLE_ROWS    = 3
+    MAX_FIELDS_PER_ROW = 10
+    MAX_VALUE_CHARS    = 300
+
+    def _truncate_value(v):
+        if isinstance(v, str) and len(v) > MAX_VALUE_CHARS:
+            return v[:MAX_VALUE_CHARS] + "...[truncated]"
+        return v
+
     compact = []
-    for r in rows[:5]:
-        compact.append({k: v for k, v in r.items() if v not in (None, "", [])})
+    for r in rows[:MAX_SAMPLE_ROWS]:
+        kept = {k: _truncate_value(v) for k, v in r.items() if v not in (None, "", [])}
+        if len(kept) > MAX_FIELDS_PER_ROW:
+            kept = dict(list(kept.items())[:MAX_FIELDS_PER_ROW])
+            kept["_truncated_fields"] = True
+        compact.append(kept)
 
     return {
-        "status":   status,
-        "rows":     count,
-        "summary":  f"{count} rows returned",
-        "sample":   compact,
+        "status":    status,
+        "rows":      count,
+        "summary":   f"{count} rows returned",
+        "sample":    compact,
+        "truncated": count > MAX_SAMPLE_ROWS,
     }
 
 
@@ -2298,36 +2304,31 @@ def run_investigation_checklist(
         "incident_id":          incident_id,
         "checklist_used":       cl,
         "checklist_auto":       checklist == "auto",
-        # ── Core incident data ─────────────────────────────────────────────
-        "incident":             inc_data,
-        # ── Similar history ────────────────────────────────────────────────
-        "similar_history":      (hist_res.get("data") or {}) if hist_res.get("ok") else {"error": str(hist_res)},
-        # ── Entity summary for report writing ─────────────────────────────
+        # ── Only the distilled facts the agent needs to drive per-entity queries ──
+        # Full incident metadata is NOT embedded — caller must use get_incident_report.
         "entities_extracted": {
-            "hosts":   hosts,
-            "users":   users,
-            "ips":     ips,
+            "hosts":        hosts,
+            "users":        users,
+            "ips":          ips,
             "primary_host": safe_host,
             "primary_user": safe_user,
             "primary_ip":   safe_ip,
         },
-        # ── MITRE ─────────────────────────────────────────────────────────
         "mitre": {
             "tactics":    tactics,
             "techniques": list((inc_data.get("mitre") or {}).get("techniques") or []),
         },
-        # ── All telemetry buckets ──────────────────────────────────────────
-        "telemetry": buckets,
-        # ── Escalation triggers found ──────────────────────────────────────
+        # ── Telemetry buckets (compact summary format from _summarise_bucket) ──
+        "telemetry":            buckets,
         "escalation_triggers":  escalation_triggers,
         "escalation_fired":     bool(escalation_triggers),
-        # ── Buckets expanded due to sparse initial window ──────────────────
         "expanded_buckets":     expanded_buckets,
-        # ── Checklist completeness audit ──────────────────────────────────
         "checklist_coverage": {
             t["bucket"]: buckets.get(t["bucket"], {}).get("status", "missing")
             for t in tasks
         },
+        # ── Pointer instead of embedding similar_history ──
+        "similar_history_available": bool(hist_res.get("ok")),
     })
 
 # ─────────────────────────────────────────────────────────────
@@ -2460,147 +2461,7 @@ SecurityIncident
     })
 
 # ============================================================
-# CALLER IDENTITY MIDDLEWARE  (Azure EasyAuth)
-# ============================================================
-# Azure EasyAuth validates the Entra ID token before the request
-# reaches this code and injects pre-decoded identity headers:
-#
-#   X-MS-CLIENT-PRINCIPAL-NAME  → UPN / email (users) or app display name (SPs)
-#   X-MS-CLIENT-PRINCIPAL-ID    → Entra Object ID  (stable, unique)
-#   X-MS-CLIENT-PRINCIPAL-IDP   → identity provider, e.g. "aad"
-#   X-MS-CLIENT-PRINCIPAL       → base64 JSON with all claims
-#
-# If EasyAuth is bypassed (e.g. local dev / warm-up ping) all fields
-# fall back to "unauthenticated" so logging never crashes.
-# ============================================================
-
-import base64 as _base64
-
-def _parse_easyauth_principal(raw_b64: str) -> dict:
-    """Decode the X-MS-CLIENT-PRINCIPAL base64 blob into a claims dict."""
-    try:
-        padding = 4 - len(raw_b64) % 4
-        padded  = raw_b64 + ("=" * (padding % 4))
-        payload = _base64.b64decode(padded).decode("utf-8", errors="replace")
-        data    = json.loads(payload)
-        # Shape: {"auth_typ": "aad", "claims": [{"typ": "...", "val": "..."}], ...}
-        claims  = {c["typ"]: c["val"] for c in data.get("claims", []) if "typ" in c and "val" in c}
-        return claims
-    except Exception:
-        return {}
-
-
-def _log_caller(scope: dict) -> None:
-    """Extract EasyAuth identity from ASGI scope headers and log to App Insights + stdout."""
-    headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope.get("headers", [])}
-
-    # ── EasyAuth injected headers ──────────────────────────────────────────
-    principal_name = headers.get("x-ms-client-principal-name", "")
-    principal_id   = headers.get("x-ms-client-principal-id", "")
-    principal_idp  = headers.get("x-ms-client-principal-idp", "")
-    principal_b64  = headers.get("x-ms-client-principal", "")
-
-    # ── Decode full claims for richer identity ─────────────────────────────
-    claims = _parse_easyauth_principal(principal_b64) if principal_b64 else {}
-
-    # Prefer app display name for service principals, UPN for users
-    app_id       = claims.get("appid") or claims.get("azp", "")          # SP client_id
-    app_name     = claims.get("app_displayname", "")                       # SP display name
-    upn          = claims.get("upn") or claims.get("preferred_username", "")  # human user
-    tenant_id    = claims.get("tid", "")
-
-    # Friendly caller label: app name > UPN > principal_name > "unauthenticated"
-    caller_label = app_name or upn or principal_name or "unauthenticated"
-
-    # ── Request metadata ───────────────────────────────────────────────────
-    path        = scope.get("path", "unknown")
-    method      = scope.get("method", "unknown")
-    user_agent  = headers.get("user-agent", "unknown")
-    ip = (
-        headers.get("x-forwarded-for", "").split(",")[0].strip()
-        or (scope.get("client") or ["unknown"])[0]
-    )
-
-    properties = {
-        # Identity
-        "caller":        caller_label,
-        "principal_id":  principal_id  or "unknown",
-        "principal_idp": principal_idp or "unknown",
-        "app_id":        app_id        or "unknown",
-        "upn":           upn           or "unknown",
-        "tenant_id":     tenant_id     or "unknown",
-        # Request
-        "path":          path,
-        "method":        method,
-        "ip":            ip,
-        "user_agent":    user_agent,
-    }
-
-    logger.info(
-        "MCP_CALLER | caller=%s principal_id=%s app_id=%s tenant=%s ip=%s path=%s",
-        caller_label, principal_id or "?", app_id or "?", tenant_id or "?", ip, path,
-    )
-
-    if _telemetry_client:
-        try:
-            _telemetry_client.track_event("MCPCallerRequest", properties=properties)
-            _telemetry_client.flush()
-        except Exception as exc:
-            logger.warning("AppInsights log failed: %s", exc)
-
-
-class CallerIdentityMiddleware:
-    """Thin ASGI middleware — logs EasyAuth caller identity on every HTTP request."""
-
-    def __init__(self, app):
-        self._app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") == "http":
-            try:
-                _log_caller(scope)
-            except Exception as exc:
-                logger.warning("CallerIdentityMiddleware error: %s", exc)
-        await self._app(scope, receive, send)
-
-
-# ============================================================
-# ACCEPT HEADER MIDDLEWARE
-# ============================================================
-# Foundry's A2A tool enumeration only sends 'application/json'
-# but FastMCP requires both 'application/json' and
-# 'text/event-stream'. This middleware injects the correct
-# Accept header if it is missing so FastMCP never returns 406.
-# ============================================================
-
-class AcceptHeaderMiddleware:
-    """Ensures every request carries the Accept header FastMCP requires."""
-
-    _REQUIRED_ACCEPT = b"application/json, text/event-stream"
-
-    def __init__(self, app):
-        self._app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") == "http":
-            try:
-                headers = [
-                    (k, v) for k, v in scope.get("headers", [])
-                    if k.lower() != b"accept"
-                ]
-                headers.append((b"accept", self._REQUIRED_ACCEPT))
-                scope["headers"] = headers
-            except Exception as exc:
-                logger.warning("AcceptHeaderMiddleware error: %s", exc)
-        await self._app(scope, receive, send)
-
-
-# ============================================================
 # EXPORT ASGI APP
 # ============================================================
 
-asgi_app = AcceptHeaderMiddleware(
-    CallerIdentityMiddleware(
-        mcp.http_app(path="/mcp", stateless_http=True)
-    )
-)
+asgi_app = mcp.http_app(path="/mcp", stateless_http=True)

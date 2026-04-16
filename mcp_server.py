@@ -94,6 +94,34 @@ MAX_HOURS_ANALYZE_ENTITY = 168
 MAX_HOURS_INCIDENT = 168
 
 # ============================================================
+# IOC ENRICHMENT CONFIGURATION (VirusTotal + AbuseIPDB)
+# ============================================================
+
+VIRUSTOTAL_API_KEY = os.environ.get("VIRUSTOTAL_API_KEY", "")
+ABUSEIPDB_API_KEY  = os.environ.get("ABUSEIPDB_API_KEY", "")
+
+# Cache TTL in seconds (default 1h)
+IOC_CACHE_TTL = int(os.environ.get("IOC_CACHE_TTL", "3600"))
+
+# Max IOCs auto-enriched per checklist run (stay under free-tier rate limits)
+IOC_MAX_IPS_PER_INCIDENT     = int(os.environ.get("IOC_MAX_IPS_PER_INCIDENT", "5"))
+IOC_MAX_DOMAINS_PER_INCIDENT = int(os.environ.get("IOC_MAX_DOMAINS_PER_INCIDENT", "3"))
+IOC_MAX_HASHES_PER_INCIDENT  = int(os.environ.get("IOC_MAX_HASHES_PER_INCIDENT", "3"))
+
+# Thresholds for auto-escalation to risk=High
+VT_MALICIOUS_VOTES_THRESHOLD = int(os.environ.get("VT_MALICIOUS_VOTES_THRESHOLD", "5"))
+ABUSEIPDB_SCORE_THRESHOLD    = int(os.environ.get("ABUSEIPDB_SCORE_THRESHOLD", "75"))
+
+# Rate limit (approximate — token bucket)
+#   VirusTotal free tier: 4 req/min, 500 req/day
+#   AbuseIPDB free tier:  1000 req/day, ~1 req/sec
+VT_MIN_INTERVAL_SEC        = float(os.environ.get("VT_MIN_INTERVAL_SEC", "16"))      # 60/4 + buffer
+ABUSEIPDB_MIN_INTERVAL_SEC = float(os.environ.get("ABUSEIPDB_MIN_INTERVAL_SEC", "1"))
+
+# Per-call timeout for IOC HTTP requests
+IOC_HTTP_TIMEOUT = int(os.environ.get("IOC_HTTP_TIMEOUT", "10"))
+
+# ============================================================
 # SITE-PREFIX → SITE NAME MAP
 # ============================================================
 _SITE_PREFIX_MAP: Dict[str, str] = {
@@ -840,6 +868,381 @@ def _build_confluence_html(doc: dict) -> str:
         kql=doc.get("kql", {}).get("query", ""),
         entities=entities_html,
     )
+
+# ============================================================
+# IOC ENRICHMENT — VirusTotal + AbuseIPDB
+# ============================================================
+#
+# Two-provider IOC lookup with in-memory cache and rate limiting.
+#
+#   VirusTotal   — supports IP, domain, URL, hash (sha256/sha1/md5)
+#   AbuseIPDB    — IP only
+#
+# Thread-safe cache keyed by (provider, normalized_ioc).
+# Simple token-bucket rate limit per provider to respect free tiers.
+#
+# Required env vars:
+#   VIRUSTOTAL_API_KEY
+#   ABUSEIPDB_API_KEY
+#
+# Optional env vars (see CONFIGURATION):
+#   IOC_CACHE_TTL, VT_MIN_INTERVAL_SEC, ABUSEIPDB_MIN_INTERVAL_SEC,
+#   VT_MALICIOUS_VOTES_THRESHOLD, ABUSEIPDB_SCORE_THRESHOLD
+
+_IOC_CACHE: Dict[str, Dict[str, Any]] = {}
+_IOC_CACHE_LOCK = threading.Lock()
+
+_IOC_RATE_LOCK = threading.Lock()
+_IOC_LAST_CALL: Dict[str, float] = {"virustotal": 0.0, "abuseipdb": 0.0}
+
+def _ioc_cache_get(key: str) -> Optional[dict]:
+    now = time.time()
+    with _IOC_CACHE_LOCK:
+        entry = _IOC_CACHE.get(key)
+        if entry and entry.get("exp", 0) > now:
+            return entry["value"]
+        if entry:
+            _IOC_CACHE.pop(key, None)
+    return None
+
+def _ioc_cache_set(key: str, value: dict) -> None:
+    with _IOC_CACHE_LOCK:
+        _IOC_CACHE[key] = {"value": value, "exp": time.time() + IOC_CACHE_TTL}
+
+def _ioc_rate_wait(provider: str, min_interval: float) -> None:
+    """Enforce a minimum inter-call gap per provider (token bucket)."""
+    with _IOC_RATE_LOCK:
+        now = time.time()
+        last = _IOC_LAST_CALL.get(provider, 0.0)
+        wait = (last + min_interval) - now
+        if wait > 0:
+            time.sleep(min(wait, 30))  # never sleep more than 30s
+        _IOC_LAST_CALL[provider] = time.time()
+
+def _detect_ioc_type(value: str) -> str:
+    """Classify an IOC string for routing to the right API endpoint."""
+    v = _normalize_entity_value(value).strip()
+    if not v:
+        return "unknown"
+    # IP
+    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", v):
+        try:
+            if all(0 <= int(p) <= 255 for p in v.split(".")):
+                return "ip"
+        except Exception:
+            pass
+    # File hashes
+    if re.fullmatch(r"[a-fA-F0-9]{64}", v):
+        return "sha256"
+    if re.fullmatch(r"[a-fA-F0-9]{40}", v):
+        return "sha1"
+    if re.fullmatch(r"[a-fA-F0-9]{32}", v):
+        return "md5"
+    # URL
+    if v.lower().startswith(("http://", "https://")):
+        return "url"
+    # Domain (has a dot and alpha TLD)
+    if "." in v:
+        tld = v.lower().split(".")[-1]
+        if tld.isalpha() and 2 <= len(tld) <= 24:
+            return "domain"
+    return "unknown"
+
+# ── VirusTotal ────────────────────────────────────────────────────────
+
+def _vt_parse_analysis(attributes: dict) -> dict:
+    """Extract the fields we care about from a VT /attributes block."""
+    stats = attributes.get("last_analysis_stats") or {}
+    votes = attributes.get("total_votes") or {}
+    return {
+        "malicious_engines":  int(stats.get("malicious") or 0),
+        "suspicious_engines": int(stats.get("suspicious") or 0),
+        "harmless_engines":   int(stats.get("harmless") or 0),
+        "undetected_engines": int(stats.get("undetected") or 0),
+        "community_malicious_votes": int(votes.get("malicious") or 0),
+        "community_harmless_votes":  int(votes.get("harmless") or 0),
+        "reputation":         attributes.get("reputation"),
+        "last_analysis_date": attributes.get("last_analysis_date"),
+        "first_seen":         attributes.get("first_submission_date") or attributes.get("creation_date"),
+        "tags":               attributes.get("tags") or [],
+        "categories":         attributes.get("categories") or {},
+        "as_owner":           attributes.get("as_owner"),
+        "asn":                attributes.get("asn"),
+        "country":            attributes.get("country"),
+        "network":            attributes.get("network"),
+        "meaningful_name":    attributes.get("meaningful_name"),
+        "type_description":   attributes.get("type_description"),
+    }
+
+def _enrich_virustotal(value: str, ioc_type: str) -> dict:
+    """
+    Query VirusTotal for IP, domain, URL, or hash.
+    Returns {"ok": True, "data": {...}} or {"ok": False, "error": "..."}.
+    """
+    if not VIRUSTOTAL_API_KEY:
+        return {"ok": False, "error": "VIRUSTOTAL_API_KEY not configured",
+                "skipped": True}
+
+    cache_key = f"vt:{ioc_type}:{value.lower()}"
+    cached = _ioc_cache_get(cache_key)
+    if cached is not None:
+        return {"ok": True, "data": cached, "cached": True}
+
+    # Map IOC type → VT URL path
+    if ioc_type == "ip":
+        path = f"ip_addresses/{value}"
+    elif ioc_type == "domain":
+        path = f"domains/{value}"
+    elif ioc_type == "url":
+        import base64
+        url_id = base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+        path = f"urls/{url_id}"
+    elif ioc_type in ("sha256", "sha1", "md5"):
+        path = f"files/{value}"
+    else:
+        return {"ok": False, "error": f"Unsupported IOC type for VT: {ioc_type}"}
+
+    _ioc_rate_wait("virustotal", VT_MIN_INTERVAL_SEC)
+
+    try:
+        resp = SESSION.get(
+            f"https://www.virustotal.com/api/v3/{path}",
+            headers={"x-apikey": VIRUSTOTAL_API_KEY,
+                     "Accept": "application/json"},
+            timeout=IOC_HTTP_TIMEOUT,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"HTTP error: {e}"}
+
+    if resp.status_code == 404:
+        result = {
+            "provider": "virustotal",
+            "ioc": value,
+            "ioc_type": ioc_type,
+            "status": "not_found",
+            "summary": "Not seen by VirusTotal",
+        }
+        _ioc_cache_set(cache_key, result)
+        return {"ok": True, "data": result}
+
+    if resp.status_code == 429:
+        return {"ok": False, "error": "VirusTotal rate limit hit (429)"}
+
+    if resp.status_code == 401:
+        return {"ok": False, "error": "VirusTotal auth failed (check API key)"}
+
+    if not resp.ok:
+        return {"ok": False, "error": f"VirusTotal HTTP {resp.status_code}: {resp.text[:200]}"}
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        return {"ok": False, "error": f"VT JSON parse error: {e}"}
+
+    attrs = (payload.get("data") or {}).get("attributes") or {}
+    analysis = _vt_parse_analysis(attrs)
+    malicious = analysis["malicious_engines"]
+
+    result = {
+        "provider": "virustotal",
+        "ioc": value,
+        "ioc_type": ioc_type,
+        "status": "found",
+        "malicious_engines":  malicious,
+        "suspicious_engines": analysis["suspicious_engines"],
+        "harmless_engines":   analysis["harmless_engines"],
+        "community_malicious_votes": analysis["community_malicious_votes"],
+        "reputation":         analysis["reputation"],
+        "last_analysis_date": analysis["last_analysis_date"],
+        "first_seen":         analysis["first_seen"],
+        "tags":               analysis["tags"],
+        "categories":         analysis["categories"],
+        "as_owner":           analysis["as_owner"],
+        "asn":                analysis["asn"],
+        "country":            analysis["country"],
+        "meaningful_name":    analysis["meaningful_name"],
+        "type_description":   analysis["type_description"],
+        "verdict":            ("malicious" if malicious >= VT_MALICIOUS_VOTES_THRESHOLD
+                               else "suspicious" if malicious > 0 or analysis["suspicious_engines"] > 0
+                               else "clean"),
+        "gui_link":           f"https://www.virustotal.com/gui/{'ip-address' if ioc_type=='ip' else ioc_type}/{value}",
+    }
+
+    _ioc_cache_set(cache_key, result)
+    return {"ok": True, "data": result}
+
+# ── AbuseIPDB ─────────────────────────────────────────────────────────
+
+def _enrich_abuseipdb(ip: str) -> dict:
+    """Query AbuseIPDB for an IP address."""
+    if not ABUSEIPDB_API_KEY:
+        return {"ok": False, "error": "ABUSEIPDB_API_KEY not configured",
+                "skipped": True}
+
+    cache_key = f"abuseipdb:ip:{ip}"
+    cached = _ioc_cache_get(cache_key)
+    if cached is not None:
+        return {"ok": True, "data": cached, "cached": True}
+
+    _ioc_rate_wait("abuseipdb", ABUSEIPDB_MIN_INTERVAL_SEC)
+
+    try:
+        resp = SESSION.get(
+            "https://api.abuseipdb.com/api/v2/check",
+            headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
+            params={"ipAddress": ip, "maxAgeInDays": "90", "verbose": ""},
+            timeout=IOC_HTTP_TIMEOUT,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"HTTP error: {e}"}
+
+    if resp.status_code == 429:
+        return {"ok": False, "error": "AbuseIPDB rate limit hit (429)"}
+
+    if resp.status_code in (401, 403):
+        return {"ok": False, "error": "AbuseIPDB auth failed (check API key)"}
+
+    if not resp.ok:
+        return {"ok": False, "error": f"AbuseIPDB HTTP {resp.status_code}: {resp.text[:200]}"}
+
+    try:
+        d = (resp.json() or {}).get("data") or {}
+    except Exception as e:
+        return {"ok": False, "error": f"AbuseIPDB JSON parse error: {e}"}
+
+    score = int(d.get("abuseConfidenceScore") or 0)
+    result = {
+        "provider": "abuseipdb",
+        "ioc": ip,
+        "ioc_type": "ip",
+        "status": "found",
+        "abuse_confidence_score": score,
+        "total_reports":   d.get("totalReports"),
+        "num_distinct_users": d.get("numDistinctUsers"),
+        "last_reported_at": d.get("lastReportedAt"),
+        "country_code":    d.get("countryCode"),
+        "country_name":    d.get("countryName"),
+        "usage_type":      d.get("usageType"),
+        "isp":             d.get("isp"),
+        "domain":          d.get("domain"),
+        "is_tor":          d.get("isTor"),
+        "is_whitelisted":  d.get("isWhitelisted"),
+        "verdict":         ("malicious" if score >= ABUSEIPDB_SCORE_THRESHOLD
+                            else "suspicious" if score >= 25
+                            else "clean"),
+        "gui_link":        f"https://www.abuseipdb.com/check/{ip}",
+    }
+
+    _ioc_cache_set(cache_key, result)
+    return {"ok": True, "data": result}
+
+# ── Combined enrichment ───────────────────────────────────────────────
+
+def _enrich_ioc(value: str, value_type: Optional[str] = None) -> dict:
+    """
+    Run all applicable IOC providers for a given value.
+    Returns:
+      {
+        "ioc": "...",
+        "ioc_type": "ip" | "domain" | "sha256" | ...,
+        "virustotal": {...} | null,
+        "abuseipdb":  {...} | null,           (IP only)
+        "verdict":    "malicious" | "suspicious" | "clean" | "unknown",
+        "escalate":   true | false
+      }
+    """
+    value = _normalize_entity_value(value)
+    if not value:
+        return {"ok": False, "error": "empty value"}
+
+    ioc_type = (value_type or "").strip().lower() or _detect_ioc_type(value)
+
+    if ioc_type == "unknown":
+        return {"ok": False, "error": f"Could not detect IOC type for: {value}"}
+
+    result = {
+        "ioc": value,
+        "ioc_type": ioc_type,
+        "virustotal": None,
+        "abuseipdb":  None,
+        "verdict":    "unknown",
+        "escalate":   False,
+    }
+
+    # VirusTotal — runs for all supported types
+    vt_res = _enrich_virustotal(value, ioc_type)
+    if vt_res.get("ok"):
+        result["virustotal"] = vt_res["data"]
+    else:
+        result["virustotal"] = {
+            "provider": "virustotal",
+            "status":   "error",
+            "error":    vt_res.get("error"),
+            "skipped":  vt_res.get("skipped", False),
+        }
+
+    # AbuseIPDB — IP only
+    if ioc_type == "ip":
+        ab_res = _enrich_abuseipdb(value)
+        if ab_res.get("ok"):
+            result["abuseipdb"] = ab_res["data"]
+        else:
+            result["abuseipdb"] = {
+                "provider": "abuseipdb",
+                "status":   "error",
+                "error":    ab_res.get("error"),
+                "skipped":  ab_res.get("skipped", False),
+            }
+
+    # ── Aggregate verdict ──────────────────────────────────────────
+    vt = result["virustotal"] if isinstance(result["virustotal"], dict) else {}
+    ab = result["abuseipdb"]  if isinstance(result["abuseipdb"], dict) else {}
+
+    vt_malicious  = int(vt.get("malicious_engines") or 0)
+    ab_score      = int(ab.get("abuse_confidence_score") or 0)
+    vt_suspicious = int(vt.get("suspicious_engines") or 0)
+
+    if (vt_malicious >= VT_MALICIOUS_VOTES_THRESHOLD
+            or ab_score >= ABUSEIPDB_SCORE_THRESHOLD):
+        result["verdict"]  = "malicious"
+        result["escalate"] = True
+    elif vt_malicious > 0 or vt_suspicious > 0 or ab_score >= 25:
+        result["verdict"] = "suspicious"
+    elif vt.get("status") == "found" or ab.get("status") == "found":
+        result["verdict"] = "clean"
+    else:
+        result["verdict"] = "unknown"
+
+    return {"ok": True, "data": result}
+
+def _enrich_iocs_parallel(iocs: List[Tuple[str, str]],
+                          max_workers: int = 4) -> Dict[str, dict]:
+    """
+    Enrich a list of (value, ioc_type) tuples in parallel.
+    Returns dict keyed by ioc value.
+    Rate limits are still enforced inside each enrichment call, so parallel
+    execution doesn't bypass VT's 4/min cap — it just reduces idle time on
+    cache hits and the faster AbuseIPDB lane.
+    """
+    results: Dict[str, dict] = {}
+    if not iocs:
+        return results
+
+    def _one(item):
+        val, vt_type = item
+        res = _enrich_ioc(val, vt_type)
+        return val, res
+
+    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, 4))) as ex:
+        futures = {ex.submit(_one, it): it[0] for it in iocs}
+        for fut in as_completed(futures):
+            try:
+                key, res = fut.result(timeout=IOC_HTTP_TIMEOUT * 4)
+                results[key] = res
+            except Exception as e:
+                key = futures[fut]
+                results[key] = {"ok": False, "error": str(e)}
+    return results
 
 # ============================================================
 # TOOLS — diagnostics
@@ -2269,13 +2672,40 @@ def _scan_for_surfaced_hosts(buckets: Dict[str, dict], known_hosts: List[str]) -
     return sorted(surfaced)[:5]
 
 # ============================================================
+# enrich_ioc tool  (standalone, on-demand)
+# ============================================================
+
+_register_tool_def("enrich_ioc",
+    ("Look up an IOC (IP, domain, URL, SHA256/SHA1/MD5) in threat-intel feeds. "
+     "Queries VirusTotal for all supported types, and AbuseIPDB additionally for IPs. "
+     "Returns reputation verdict ('malicious' / 'suspicious' / 'clean' / 'unknown'), "
+     "AV detection counts, community votes, geolocation, ASN, categories, and first-seen dates. "
+     "Results are cached in-memory for 1 hour to respect free-tier API rate limits. "
+     "Use this when you want ground-truth reputation on an IP/domain/hash surfaced by the "
+     "checklist or mentioned in an alert. Automatically runs for primary entities inside "
+     "run_investigation_checklist — only call this tool for additional IOCs not already covered."),
+    {"value":      "IOC string — IP, domain, URL, SHA256, SHA1, or MD5",
+     "value_type": "optional: 'ip' | 'domain' | 'url' | 'sha256' | 'sha1' | 'md5' (auto-detected if omitted)"})
+
+@mcp.tool
+def enrich_ioc(value: str, value_type: Optional[str] = None) -> dict:
+    if not value:
+        return _fail("value is required", code="VALIDATION_ERROR")
+    res = _enrich_ioc(value, value_type)
+    if not res.get("ok"):
+        return _fail(res.get("error", "enrichment failed"), code="ENRICHMENT_ERROR")
+    return _ok(res["data"])
+
+# ============================================================
 # run_investigation_checklist  ───  uses all three fixes
 # ============================================================
 
 _register_tool_def("run_investigation_checklist",
     ("Executes a parallel server-side batch of telemetry queries for an incident and returns "
      "compact bucket summaries. Auto-detects checklist branch from incident title + alert names "
-     "+ MITRE tactics (title is the primary source, alert names and tactics are supplementary)."),
+     "+ MITRE tactics (title is the primary source, alert names and tactics are supplementary). "
+     "Also auto-enriches primary IOCs (IPs, domains, hashes) via VirusTotal + AbuseIPDB and "
+     "escalates the incident if any IOC scores above threshold."),
     {"incident_id":  "Sentinel incident number",
      "checklist":    "auto | execution | identity | lateral_movement | network | malware | cloud | behavioral | default",
      "timespan":     "ISO8601 duration, default P7D"})
@@ -2399,6 +2829,111 @@ def run_investigation_checklist(
 
     site_detected = _detect_site_from_hostname(safe_host) if safe_host else None
 
+    # ── IOC ENRICHMENT (VirusTotal + AbuseIPDB) ──────────────────────────
+    # Build the IOC list from extracted entities + IPs surfaced in telemetry
+    # samples (SigninLogs IPAddress, DeviceNetworkEvents RemoteIP, etc.).
+    # Capped per-type to stay within free-tier API limits.
+    ioc_list: List[Tuple[str, str]] = []
+    seen_iocs = set()
+
+    def _add_ioc(val: str, vt_type: str):
+        if not val:
+            return
+        norm = _normalize_entity_value(str(val))
+        if not norm or norm.lower() in seen_iocs:
+            return
+        seen_iocs.add(norm.lower())
+        ioc_list.append((norm, vt_type))
+
+    # IPs — primary + up to N from entities + surfaced from telemetry
+    ips_to_enrich: List[str] = []
+    if safe_ip:
+        ips_to_enrich.append(safe_ip)
+    for ip in (ips or []):
+        if ip and ip not in ips_to_enrich:
+            ips_to_enrich.append(ip)
+    # Pull IPs that appeared in telemetry samples
+    ip_fields = ["IPAddress", "IpAddress", "RemoteIP", "ClientIP", "CallerIpAddress",
+                 "SourceIP", "LocalIP"]
+    for bid, b in buckets.items():
+        for row in (b.get("sample") or []):
+            for f in ip_fields:
+                v = row.get(f)
+                if isinstance(v, str) and re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", v):
+                    if v not in ips_to_enrich:
+                        ips_to_enrich.append(v)
+        if len(ips_to_enrich) >= IOC_MAX_IPS_PER_INCIDENT * 3:
+            break
+    for ip in ips_to_enrich[:IOC_MAX_IPS_PER_INCIDENT]:
+        _add_ioc(ip, "ip")
+
+    # Domains — cap at N
+    for dom in (domains or [])[:IOC_MAX_DOMAINS_PER_INCIDENT]:
+        _add_ioc(dom, "domain")
+
+    # Hashes — look for hash-shaped strings in entities.files or .processes
+    # (rarely surfaced for this kind of incident, but safe to try)
+    hashes_found: List[Tuple[str, str]] = []
+    for entity_list in [(ents.get("files") or []),
+                        (ents.get("processes") or [])]:
+        for v in entity_list:
+            t = _detect_ioc_type(str(v))
+            if t in ("sha256", "sha1", "md5"):
+                hashes_found.append((str(v), t))
+    for h, ht in hashes_found[:IOC_MAX_HASHES_PER_INCIDENT]:
+        _add_ioc(h, ht)
+
+    # Run enrichment in parallel (rate-limited per provider internally)
+    ioc_enrichment: Dict[str, dict] = {}
+    if ioc_list and (VIRUSTOTAL_API_KEY or ABUSEIPDB_API_KEY):
+        enrichment_raw = _enrich_iocs_parallel(ioc_list, max_workers=4)
+        for key, res in enrichment_raw.items():
+            if res.get("ok"):
+                ioc_enrichment[key] = res["data"]
+            else:
+                ioc_enrichment[key] = {
+                    "ioc": key,
+                    "status": "error",
+                    "error": res.get("error"),
+                }
+
+    # Feed malicious IOCs into the escalation trigger list
+    for ioc_key, ioc_data in ioc_enrichment.items():
+        if not isinstance(ioc_data, dict):
+            continue
+        if ioc_data.get("escalate") is True:
+            vt = ioc_data.get("virustotal") or {}
+            ab = ioc_data.get("abuseipdb") or {}
+            escalation_triggers.append({
+                "trigger": "ioc_malicious",
+                "ioc":     ioc_key,
+                "ioc_type":ioc_data.get("ioc_type"),
+                "verdict": ioc_data.get("verdict"),
+                "vt_malicious_engines":  vt.get("malicious_engines") if isinstance(vt, dict) else None,
+                "abuseipdb_score":       ab.get("abuse_confidence_score") if isinstance(ab, dict) else None,
+                "vt_link":  vt.get("gui_link") if isinstance(vt, dict) else None,
+                "ab_link":  ab.get("gui_link") if isinstance(ab, dict) else None,
+            })
+
+    # Summary counts for the agent
+    ioc_summary = {
+        "total":         len(ioc_enrichment),
+        "malicious":     sum(1 for v in ioc_enrichment.values()
+                             if isinstance(v, dict) and v.get("verdict") == "malicious"),
+        "suspicious":    sum(1 for v in ioc_enrichment.values()
+                             if isinstance(v, dict) and v.get("verdict") == "suspicious"),
+        "clean":         sum(1 for v in ioc_enrichment.values()
+                             if isinstance(v, dict) and v.get("verdict") == "clean"),
+        "unknown":       sum(1 for v in ioc_enrichment.values()
+                             if isinstance(v, dict) and v.get("verdict") == "unknown"),
+        "errors":        sum(1 for v in ioc_enrichment.values()
+                             if isinstance(v, dict) and v.get("status") == "error"),
+        "providers_enabled": {
+            "virustotal": bool(VIRUSTOTAL_API_KEY),
+            "abuseipdb":  bool(ABUSEIPDB_API_KEY),
+        },
+    }
+
     return _ok({
         "incident_id":          incident_id,
         "incident_title":       incident_title,
@@ -2424,6 +2959,8 @@ def run_investigation_checklist(
         "expanded_buckets":     expanded_buckets,
         "surfaced_hosts":       surfaced_hosts,
         "surfaced_hosts_cmdb":  surfaced_cmdb,
+        "ioc_enrichment":       ioc_enrichment,
+        "ioc_summary":          ioc_summary,
         "checklist_coverage": {
             t["bucket"]: buckets.get(t["bucket"], {}).get("status", "missing")
             for t in tasks

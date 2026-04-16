@@ -28,7 +28,7 @@ _RETRY_POLICY = Retry(
     raise_on_status=False,
 )
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "SentinelMCP/1.1"})
+SESSION.headers.update({"User-Agent": "SentinelMCP/1.2"})
 SESSION.mount("https://", HTTPAdapter(max_retries=_RETRY_POLICY))
 
 mcp = FastMCP("SentinelMCP")
@@ -96,17 +96,10 @@ MAX_HOURS_INCIDENT = 168
 # ============================================================
 # SITE-PREFIX → SITE NAME MAP
 # ============================================================
-# Starter mapping. EXTEND as you receive the official prefix → site doc.
-# Lookup: longest-prefix-wins, case-insensitive, applied to the leftmost
-# alphabetic segment of the hostname (before any digits/hyphens/dots).
-#
-# To add a site: "newprefix": "SiteName"
-# SiteName must match the suffix in your *_CL tables (e.g. "Euronext"
-# matches WindowsEuronext_CL, LinuxEuronext_CL, CiscoEuronext_CL).
 _SITE_PREFIX_MAP: Dict[str, str] = {
     "os":    "OsloBors",
-    "obg":   "OsloBors",     # observed: obgeuslptsk001v
-    "osdc":  "OsloBors",     # observed: osdcsdco10v
+    "obg":   "OsloBors",
+    "osdc":  "OsloBors",
     "eun":   "Euronext",
     "eu":    "Euronext",
     "clr":   "Clearing",
@@ -120,22 +113,19 @@ _SITE_PREFIX_MAP: Dict[str, str] = {
     "cwc":   "CWC",
     "bor":   "Borsa",
     "bita":  "Bita",
-    "slp":   "OsloBors",     # observed: slp-iqserv.svc tied to Oslo hosts
+    "slp":   "OsloBors",
 }
 
 def _detect_site_from_hostname(hostname: str) -> Optional[str]:
-    """Returns the site name (e.g. 'Euronext') or None if no match."""
     if not hostname:
         return None
     h = hostname.lower().strip()
     if "." in h:
         h = h.split(".")[0]
-    # Strip any leading non-alpha (rare but safe)
     m = re.match(r"^([a-z]+)", h)
     if not m:
         return None
     head = m.group(1)
-    # Longest-prefix-wins (cap 6 chars)
     for plen in range(min(len(head), 6), 1, -1):
         prefix = head[:plen]
         if prefix in _SITE_PREFIX_MAP:
@@ -143,7 +133,6 @@ def _detect_site_from_hostname(hostname: str) -> Optional[str]:
     return None
 
 def _site_tables_for(site: str) -> List[str]:
-    """All *_CL tables matching a site suffix from the loaded catalog."""
     if not site:
         return []
     _ensure_catalog_loaded()
@@ -187,7 +176,7 @@ def _register_tool_def(name: str, description: str, params: dict) -> None:
     _TOOL_DEFS.append({"name": name, "description": description, "params": params})
 
 # ============================================================
-# MANAGED IDENTITY  (thread-safe token cache)
+# MANAGED IDENTITY
 # ============================================================
 
 _TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -241,7 +230,6 @@ def get_managed_identity_token(resource: str) -> str:
 _TABLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 def parse_timespan_to_hours(timespan: str) -> float:
-    """Supports: PT#H, PT#M, PT#H#M, P#D"""
     ts = (timespan or "").strip()
 
     m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?", ts)
@@ -312,14 +300,7 @@ def ensure_take_limit(kql: str, limit: int) -> str:
         return kql
     return f"{kql}\n| take {limit}"
 
-# ── Entity normalization (handle weird Sentinel formats) ─────────────────
 def _normalize_entity_value(value: str) -> str:
-    """
-    Sentinel sometimes wraps entity names in JSON-array-like strings:
-      ["rafael dantas"]  →  rafael dantas
-      ['svc-account']    →  svc-account
-    Also strips leading/trailing whitespace and quotes.
-    """
     if not value:
         return value
     v = str(value).strip()
@@ -329,16 +310,52 @@ def _normalize_entity_value(value: str) -> str:
     v = v.strip('"\'')
     return v
 
+# ── NEW: flatten MITRE technique strings that may be double-JSON-encoded ─
+def _flatten_mitre_field(raw_values) -> List[str]:
+    """
+    Sentinel sometimes returns Tactics/Techniques as:
+      - a plain string "T1110"
+      - a JSON-encoded list string like "[\"T1110\",\"T1078\"]"
+      - a comma-separated string "T1110, T1078"
+      - an already-parsed list ["T1110"]
+    This flattens all cases into a clean sorted list.
+    """
+    out = set()
+    for v in raw_values or []:
+        if v is None:
+            continue
+        if isinstance(v, list):
+            for x in v:
+                if x:
+                    out.add(str(x).strip())
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    for x in parsed:
+                        if x:
+                            out.add(str(x).strip())
+                    continue
+            except Exception:
+                pass
+        if "," in s:
+            for part in s.split(","):
+                p = part.strip().strip('"').strip("'")
+                if p:
+                    out.add(p)
+            continue
+        out.add(s)
+    return sorted(out)
+
 def detect_entity_type(value: str) -> str:
-    """
-    Improved detection — handles service accounts, on-prem accounts, hostname
-    vs domain disambiguation. Always normalizes the value first.
-    """
     v = _normalize_entity_value(value).strip()
     if not v:
         return "host"
 
-    # IP address
     if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", v):
         try:
             parts = [int(x) for x in v.split(".")]
@@ -347,11 +364,9 @@ def detect_entity_type(value: str) -> str:
         except Exception:
             pass
 
-    # UPN / email-shaped
     if "@" in v:
         return "user"
 
-    # File hashes
     if re.fullmatch(r"[a-fA-F0-9]{64}", v):
         return "sha256"
     if re.fullmatch(r"[a-fA-F0-9]{40}", v):
@@ -361,7 +376,6 @@ def detect_entity_type(value: str) -> str:
 
     lowered = v.lower()
 
-    # Service account heuristics — MUST run before host fallback
     if (lowered.endswith(".svc")
         or lowered.endswith("$")
         or lowered.startswith("svc-") or lowered.startswith("svc_")
@@ -370,8 +384,6 @@ def detect_entity_type(value: str) -> str:
         or re.search(r"\bsvc\b", lowered)):
         return "user"
 
-    # Domain heuristic — has a real TLD-like ending (alpha-only, 2-24 chars)
-    # Hostnames like "host01v" end in digits/v/p, not alpha-only TLD
     if "." in v:
         last_segment = lowered.split(".")[-1]
         if last_segment.isalpha() and 2 <= len(last_segment) <= 24:
@@ -456,16 +468,9 @@ def _catalog_tables_for_domains(domains: List[str]) -> List[str]:
 CMDB_TABLE = "COVERAGE_CMDB"
 
 def _query_cmdb_entity(value: str, timespan: str = "P90D") -> dict:
-    """
-    Three-stage CMDB lookup:
-      1. Structured columns (full value)
-      2. Core hostname segment (strip domain suffix)
-      3. Broad tostring(*) contains fallback
-    """
     safe_value = escape_kql_string(value)
     core = safe_value.split(".")[0] if "." in safe_value else safe_value
 
-    # Stage 1
     structured_kql = f"""
 {CMDB_TABLE}
 | where
@@ -489,7 +494,6 @@ def _query_cmdb_entity(value: str, timespan: str = "P90D") -> dict:
     if res.get("ok") and _la_first_table_dicts(res["data"]):
         return res
 
-    # Stage 2 — core segment (only run if it differs from full value)
     if core != safe_value:
         core_kql = f"""
 {CMDB_TABLE}
@@ -509,7 +513,6 @@ def _query_cmdb_entity(value: str, timespan: str = "P90D") -> dict:
         if res2.get("ok") and _la_first_table_dicts(res2["data"]):
             return res2
 
-    # Stage 3 — broad fallback
     fallback_kql = f"""
 {CMDB_TABLE}
 | where tostring(*) contains "{safe_value}"
@@ -533,11 +536,8 @@ def la_query(kql: str, timespan: str) -> dict:
     try:
         token = get_managed_identity_token(LOG_ANALYTICS_RESOURCE)
     except Exception as e:
-        return _fail(
-            "Failed to acquire Managed Identity token",
-            code="MANAGED_IDENTITY_ERROR",
-            detail=str(e),
-        )
+        return _fail("Failed to acquire Managed Identity token",
+                     code="MANAGED_IDENTITY_ERROR", detail=str(e))
 
     url = f"https://api.loganalytics.io/v1/workspaces/{WORKSPACE_ID}/query"
     start = time.time()
@@ -545,47 +545,32 @@ def la_query(kql: str, timespan: str) -> dict:
     try:
         response = SESSION.post(
             url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
             json={"query": kql, "timespan": timespan},
             timeout=HTTP_TIMEOUT_SECONDS,
         )
     except Exception as e:
-        return _fail(
-            "HTTP request to Log Analytics failed",
-            code="HTTP_ERROR",
-            detail=str(e),
-            timespan=timespan,
-        )
+        return _fail("HTTP request to Log Analytics failed",
+                     code="HTTP_ERROR", detail=str(e), timespan=timespan)
 
     elapsed_ms = int((time.time() - start) * 1000)
 
     if not response.ok:
-        logger.warning(
-            "Log Analytics query failed status=%s duration_ms=%s",
-            response.status_code, elapsed_ms,
-        )
-        return _fail(
-            "Log Analytics query failed",
-            code="LOG_ANALYTICS_ERROR",
-            status_code=response.status_code,
-            detail=response.text,
-            timespan=timespan,
-        )
+        logger.warning("Log Analytics query failed status=%s duration_ms=%s",
+                       response.status_code, elapsed_ms)
+        return _fail("Log Analytics query failed", code="LOG_ANALYTICS_ERROR",
+                     status_code=response.status_code, detail=response.text,
+                     timespan=timespan)
 
     try:
         payload = response.json()
-        logger.info("Log Analytics query ok duration_ms=%s timespan=%s", elapsed_ms, timespan)
+        logger.info("Log Analytics query ok duration_ms=%s timespan=%s",
+                    elapsed_ms, timespan)
         return _ok(payload, timespan=timespan, duration_ms=elapsed_ms)
     except Exception as e:
-        return _fail(
-            "Failed to parse Log Analytics JSON response",
-            code="PARSE_ERROR",
-            detail=str(e),
-            timespan=timespan,
-        )
+        return _fail("Failed to parse Log Analytics JSON response",
+                     code="PARSE_ERROR", detail=str(e), timespan=timespan)
 
 def _arm_get(url: str) -> dict:
     try:
@@ -596,24 +581,18 @@ def _arm_get(url: str) -> dict:
     start = time.time()
 
     try:
-        resp = SESSION.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=HTTP_TIMEOUT_SECONDS,
-        )
+        resp = SESSION.get(url, headers={"Authorization": f"Bearer {token}"},
+                           timeout=HTTP_TIMEOUT_SECONDS)
     except Exception as e:
         return _fail("HTTP request to ARM failed", code="HTTP_ERROR", detail=str(e))
 
     elapsed_ms = int((time.time() - start) * 1000)
 
     if not resp.ok:
-        logger.warning("ARM request failed status=%s duration_ms=%s", resp.status_code, elapsed_ms)
-        return _fail(
-            "ARM request failed",
-            code="ARM_ERROR",
-            status_code=resp.status_code,
-            detail=resp.text,
-        )
+        logger.warning("ARM request failed status=%s duration_ms=%s",
+                       resp.status_code, elapsed_ms)
+        return _fail("ARM request failed", code="ARM_ERROR",
+                     status_code=resp.status_code, detail=resp.text)
 
     try:
         payload = resp.json()
@@ -623,7 +602,6 @@ def _arm_get(url: str) -> dict:
         return _fail("Failed to parse ARM JSON response", code="PARSE_ERROR", detail=str(e))
 
 def _arm_get_paged(base_url: str) -> dict:
-    """Follow ARM nextLink pagination."""
     all_items = []
     url = base_url
 
@@ -646,10 +624,6 @@ def _run_queries_parallel(
     timespan: str,
     wall_clock_timeout: int = PARALLEL_WALL_CLOCK_TIMEOUT,
 ) -> Dict[str, dict]:
-    """
-    tasks: list of (task_id, table_name, kql_string)
-    Returns: dict mapping task_id → la_query result dict
-    """
     results: Dict[str, dict] = {}
 
     def _run(task_id: str, kql: str) -> Tuple[str, dict]:
@@ -674,20 +648,15 @@ def _run_queries_parallel(
                     task_id = futures[future]
                     results[task_id] = _fail(
                         "Query task failed or timed out",
-                        code="TASK_ERROR",
-                        detail=str(e),
-                    )
+                        code="TASK_ERROR", detail=str(e))
         except FuturesTimeoutError:
-            # Wall-clock hit — remaining futures are filled below as TIMEOUT
             pass
 
     for _task_id, table, _kql in tasks:
         if _task_id not in results:
             results[_task_id] = _fail(
                 f"Query timed out after {wall_clock_timeout}s",
-                code="TIMEOUT",
-                detail=f"table={table}",
-            )
+                code="TIMEOUT", detail=f"table={table}")
 
     return results
 
@@ -876,29 +845,17 @@ def _build_confluence_html(doc: dict) -> str:
 # TOOLS — diagnostics
 # ============================================================
 
-_register_tool_def(
-    "get_tools",
-    (
-        "Returns the full list of available MCP tools with their parameter formats. "
-        "Call this first if you are unsure which tool to use for a task."
-    ),
-    {},
-)
+_register_tool_def("get_tools",
+    ("Returns the full list of available MCP tools with their parameter formats. "
+     "Call this first if you are unsure which tool to use for a task."), {})
 
 @mcp.tool
 def get_tools() -> dict:
     return _ok({"tools": _TOOL_DEFS, "mcp_path": "/mcp"})
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "ping",
-    (
-        "Connectivity and configuration health check. Does not query Sentinel. "
-        "Use this to verify the MCP endpoint is reachable and the workspace is configured "
-        "before running any other tools."
-    ),
-    {},
-)
+_register_tool_def("ping",
+    ("Connectivity and configuration health check. Does not query Sentinel. "
+     "Use this to verify the MCP endpoint is reachable and the workspace is configured."), {})
 
 @mcp.tool
 def ping() -> dict:
@@ -909,15 +866,8 @@ def ping() -> dict:
         "mcp_path": "/mcp",
     })
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "debug_identity",
-    (
-        "Shows whether managed identity environment variables are present. "
-        "Use when token acquisition is failing to diagnose the root cause."
-    ),
-    {},
-)
+_register_tool_def("debug_identity",
+    "Shows whether managed identity environment variables are present.", {})
 
 @mcp.tool
 def debug_identity() -> dict:
@@ -929,16 +879,8 @@ def debug_identity() -> dict:
         "MANAGED_IDENTITY_CLIENT_ID_present": bool(os.environ.get("MANAGED_IDENTITY_CLIENT_ID")),
     })
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "get_workspace_table_catalog",
-    (
-        "Returns all workspace tables grouped by telemetry domain. "
-        "Use this to understand what data sources are available before "
-        "building queries or choosing which tables to search."
-    ),
-    {},
-)
+_register_tool_def("get_workspace_table_catalog",
+    "Returns all workspace tables grouped by telemetry domain.", {})
 
 @mcp.tool
 def get_workspace_table_catalog() -> dict:
@@ -947,12 +889,8 @@ def get_workspace_table_catalog() -> dict:
         return _fail("Workspace table catalog not loaded", code="CATALOG_NOT_LOADED")
     return _ok({"catalog": WORKSPACE_TABLE_CATALOG})
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "debug_catalog_loaded",
-    "Returns whether the workspace catalog JSON loaded successfully and which domain keys are present.",
-    {},
-)
+_register_tool_def("debug_catalog_loaded",
+    "Returns whether the workspace catalog JSON loaded successfully and which domain keys are present.", {})
 
 @mcp.tool
 def debug_catalog_loaded() -> dict:
@@ -962,15 +900,8 @@ def debug_catalog_loaded() -> dict:
         "keys": list(WORKSPACE_TABLE_CATALOG.keys()),
     })
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "list_workspace_tables",
-    (
-        "Returns a flat list of all unique table names from the workspace catalog. "
-        "Prefer get_workspace_table_catalog if you also need domain groupings."
-    ),
-    {},
-)
+_register_tool_def("list_workspace_tables",
+    "Returns a flat list of all unique table names from the workspace catalog.", {})
 
 @mcp.tool
 def list_workspace_tables() -> dict:
@@ -979,15 +910,9 @@ def list_workspace_tables() -> dict:
         return _fail("Workspace table catalog not loaded", code="CATALOG_NOT_LOADED")
     return _ok({"tables": _flatten_catalog_tables()})
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "list_tables",
-    (
-        "Lists tables that actively ingested data within the given timespan by querying the Usage table. "
-        "Prefer list_workspace_tables if you only need the static catalog."
-    ),
-    {"timespan": "ISO8601 duration like P1D, PT6H, PT24H"},
-)
+_register_tool_def("list_tables",
+    "Lists tables that actively ingested data within the given timespan by querying the Usage table.",
+    {"timespan": "ISO8601 duration like P1D, PT6H, PT24H"})
 
 @mcp.tool
 def list_tables(timespan: str = DEFAULT_TIMESPAN) -> dict:
@@ -1015,24 +940,15 @@ Usage
         return _fail("No tables returned from Log Analytics", code="EMPTY_RESULT", timespan=timespan)
 
     if "DataType" not in columns:
-        return _fail(
-            "Unexpected response shape: DataType column not present",
-            code="PARSE_ERROR",
-            timespan=timespan,
-        )
+        return _fail("Unexpected response shape: DataType column not present",
+                     code="PARSE_ERROR", timespan=timespan)
 
     idx = columns.index("DataType")
     return _ok({"tables": [row[idx] for row in rows]}, timespan=timespan)
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "preview_table",
-    (
-        "Returns 10 sample rows from the specified table. "
-        "Use this to inspect raw log data or verify a table has the expected fields."
-    ),
-    {"table": "Table name string", "timespan": "ISO8601 duration"},
-)
+_register_tool_def("preview_table",
+    "Returns 10 sample rows from the specified table.",
+    {"table": "Table name string", "timespan": "ISO8601 duration"})
 
 @mcp.tool
 def preview_table(table: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
@@ -1045,15 +961,9 @@ def preview_table(table: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
     kql = f"{table} | take 10"
     return la_query(kql, timespan)
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "get_table_schema",
-    (
-        "Returns the column names and data types for the specified table using KQL getschema. "
-        "Use this before writing a run_query KQL to understand available fields."
-    ),
-    {"table": "Table name string", "timespan": "ISO8601 duration"},
-)
+_register_tool_def("get_table_schema",
+    "Returns the column names and data types for the specified table using KQL getschema.",
+    {"table": "Table name string", "timespan": "ISO8601 duration"})
 
 @mcp.tool
 def get_table_schema(table: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
@@ -1066,21 +976,14 @@ def get_table_schema(table: str, timespan: str = DEFAULT_TIMESPAN) -> dict:
     kql = f"{table} | getschema"
     return la_query(kql, timespan)
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "run_query",
-    (
-        "Runs a custom bounded KQL query against the Sentinel workspace. "
-        "Query MUST contain at least one where clause. Max timespan 72h, max rows 200. "
-        "NOTE: This 72h limit applies ONLY to run_query — analyze_entity, "
-        "investigate_incident, and run_investigation_checklist support up to 168h."
-    ),
-    {
-        "kql": "KQL string — must include at least one where clause",
-        "timespan": "ISO8601 duration, max PT72H / P3D",
-        "max_rows": "integer 1–200, default 50",
-    },
-)
+_register_tool_def("run_query",
+    ("Runs a custom bounded KQL query against the Sentinel workspace. "
+     "Query MUST contain at least one where clause. Max timespan 72h (P3D), max rows 200. "
+     "NOTE: The 72h cap applies ONLY to run_query — analyze_entity, investigate_incident, "
+     "and run_investigation_checklist support up to 168h."),
+    {"kql": "KQL string — must include at least one where clause",
+     "timespan": "ISO8601 duration, max PT72H / P3D",
+     "max_rows": "integer 1–200, default 50"})
 
 @mcp.tool
 def run_query(kql: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAULT_ROWS) -> dict:
@@ -1097,53 +1000,35 @@ def run_query(kql: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAUL
     if hours <= 0 or hours > MAX_HOURS_RUN_QUERY:
         return _fail(
             f"Timespan exceeds allowed window ({MAX_HOURS_RUN_QUERY}h max for run_query)",
-            code="VALIDATION_ERROR",
-            detail=f"got {hours}h",
-        )
+            code="VALIDATION_ERROR", detail=f"got {hours}h")
 
     bounded_kql = ensure_take_limit(kql, clamp_rows(max_rows))
     return la_query(bounded_kql, timespan)
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "get_recent_alerts",
-    (
-        "Returns recent Microsoft Sentinel security alerts filtered by severity and timespan. "
-        "Use for quick triage feed of what is firing. "
-        "Prefer investigate_incident when you already have an incident number."
-    ),
-    {
-        "timespan": "ISO8601 duration like P1D, PT6H",
-        "severity": "optional: High | Medium | Low | Informational (omit for all)",
-        "max_rows": "integer 1–200, default 50",
-    },
-)
+_register_tool_def("get_recent_alerts",
+    "Returns recent Microsoft Sentinel security alerts filtered by severity and timespan.",
+    {"timespan": "ISO8601 duration like P1D, PT6H",
+     "severity": "optional: High | Medium | Low | Informational",
+     "max_rows": "integer 1–200, default 50"})
 
 @mcp.tool
-def get_recent_alerts(
-    timespan: str = "P1D",
-    severity: Optional[str] = None,
-    max_rows: int = DEFAULT_ROWS,
-) -> dict:
+def get_recent_alerts(timespan: str = "P1D", severity: Optional[str] = None,
+                      max_rows: int = DEFAULT_ROWS) -> dict:
     try:
         hours = parse_timespan_to_hours(timespan)
     except Exception as e:
         return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
 
     if hours <= 0 or hours > MAX_HOURS_ANALYZE_ENTITY:
-        return _fail(
-            f"Timespan exceeds allowed window ({MAX_HOURS_ANALYZE_ENTITY}h max)",
-            code="VALIDATION_ERROR",
-        )
+        return _fail(f"Timespan exceeds allowed window ({MAX_HOURS_ANALYZE_ENTITY}h max)",
+                     code="VALIDATION_ERROR")
 
     severity_filter = ""
     if severity:
         valid_severities = {"high", "medium", "low", "informational"}
         if severity.lower() not in valid_severities:
-            return _fail(
-                f"Invalid severity. Must be one of: {', '.join(valid_severities)}",
-                code="VALIDATION_ERROR",
-            )
+            return _fail(f"Invalid severity. Must be one of: {', '.join(valid_severities)}",
+                         code="VALIDATION_ERROR")
         safe_sev = escape_kql_string(severity)
         severity_filter = f'| where AlertSeverity =~ "{safe_sev}"'
 
@@ -1152,41 +1037,23 @@ def get_recent_alerts(
 SecurityAlert
 | where TimeGenerated >= ago({int(hours)}h)
 {severity_filter}
-| project
-    TimeGenerated,
-    AlertName,
-    AlertSeverity,
-    Status,
-    CompromisedEntity,
-    Tactics,
-    Techniques,
-    SystemAlertId,
-    ProductName,
-    Description
+| project TimeGenerated, AlertName, AlertSeverity, Status, CompromisedEntity,
+  Tactics, Techniques, SystemAlertId, ProductName, Description
 | order by TimeGenerated desc
 | take {limit}
 """.strip()
 
     return la_query(kql, timespan)
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "list_analytics_rules",
-    (
-        "Lists Microsoft Sentinel analytics rules. "
-        "Returns rule_id, display_name, kind, enabled, severity. "
-        "Use analyze_use_case or generate_confluence_use_case for full details."
-    ),
-    {"top": "optional int, max rules to return (default 50, hard cap 200)"},
-)
+_register_tool_def("list_analytics_rules",
+    "Lists Microsoft Sentinel analytics rules.",
+    {"top": "optional int, max rules to return (default 50, hard cap 200)"})
 
 @mcp.tool
 def list_analytics_rules(top: int = 50) -> dict:
     if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
-        return _fail(
-            "SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
-            code="CONFIG_ERROR",
-        )
+        return _fail("SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
+                     code="CONFIG_ERROR")
 
     try:
         top_i = int(top)
@@ -1216,30 +1083,17 @@ def list_analytics_rules(top: int = 50) -> dict:
 
     return _ok({"count": len(out), "rules": out})
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "analyze_use_case",
-    (
-        "Fetches a Sentinel analytic rule by rule_id or rule_name and extracts documentation-ready "
-        "key points: KQL summary, MITRE mappings, schedule, trigger thresholds, entity hints. "
-        "Use list_analytics_rules first to find rule_id or exact display name."
-    ),
-    {
-        "rule_id": "optional: analytic rule ARM resource name/GUID",
-        "rule_name": "optional: displayName exact match (case-insensitive)",
-    },
-)
+_register_tool_def("analyze_use_case",
+    ("Fetches a Sentinel analytic rule by rule_id or rule_name and extracts documentation-ready "
+     "key points."),
+    {"rule_id": "optional: analytic rule ARM resource name/GUID",
+     "rule_name": "optional: displayName exact match (case-insensitive)"})
 
 @mcp.tool
-def analyze_use_case(
-    rule_id: Optional[str] = None,
-    rule_name: Optional[str] = None,
-) -> dict:
+def analyze_use_case(rule_id: Optional[str] = None, rule_name: Optional[str] = None) -> dict:
     if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
-        return _fail(
-            "SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
-            code="CONFIG_ERROR",
-        )
+        return _fail("SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
+                     code="CONFIG_ERROR")
 
     rid = (rule_id or "").strip()
     rname = (rule_name or "").strip()
@@ -1289,29 +1143,17 @@ def analyze_use_case(
 
     return _ok(doc)
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "generate_confluence_use_case",
-    (
-        "Generates a Confluence-ready HTML documentation page for a Sentinel analytic rule, "
-        "including MITRE ATT&CK table, KQL, log sources, and entity mapping."
-    ),
-    {
-        "rule_id": "optional: analytic rule ARM resource name/GUID",
-        "rule_name": "optional: displayName exact match (case-insensitive)",
-    },
-)
+_register_tool_def("generate_confluence_use_case",
+    "Generates a Confluence-ready HTML documentation page for a Sentinel analytic rule.",
+    {"rule_id": "optional: analytic rule ARM resource name/GUID",
+     "rule_name": "optional: displayName exact match (case-insensitive)"})
 
 @mcp.tool
-def generate_confluence_use_case(
-    rule_id: Optional[str] = None,
-    rule_name: Optional[str] = None,
-) -> dict:
+def generate_confluence_use_case(rule_id: Optional[str] = None,
+                                  rule_name: Optional[str] = None) -> dict:
     if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
-        return _fail(
-            "SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
-            code="CONFIG_ERROR",
-        )
+        return _fail("SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
+                     code="CONFIG_ERROR")
 
     rid = (rule_id or "").strip()
     rname = (rule_name or "").strip()
@@ -1352,24 +1194,16 @@ def generate_confluence_use_case(
     return _ok({"rule_name": props.get("displayName"), "confluence_html": html})
 
 # ============================================================
-# analyze_entity — EXPANDED table coverage for every entity type
+# analyze_entity
 # ============================================================
 
-_register_tool_def(
-    "analyze_entity",
-    (
-        "SOC-style entity investigation across workspace tables. "
-        "Auto-detects entity type (ip, user/UPN/service-account, host, domain, sha256/sha1/md5) "
-        "from the value string. Service accounts (.svc, svc-, $, 'service' keyword) are correctly "
-        "routed to user-style queries. Returns per-table event counts, first/last seen times, "
-        "risk level, and CMDB context. Queries run in parallel."
-    ),
-    {
-        "value": "Entity string — IP, UPN, hostname, service account, domain, or file hash",
-        "timespan": "ISO8601 duration (PT6H, P1D, P7D)",
-        "max_rows": "integer 1–200 (default 50)",
-    },
-)
+_register_tool_def("analyze_entity",
+    ("SOC-style entity investigation across workspace tables. "
+     "Auto-detects entity type (ip, user/UPN/service-account, host, domain, sha256/sha1/md5). "
+     "Returns per-table event counts, first/last seen times, risk level, and CMDB context."),
+    {"value": "Entity string",
+     "timespan": "ISO8601 duration (PT6H, P1D, P7D)",
+     "max_rows": "integer 1–200 (default 50)"})
 
 @mcp.tool
 def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int = DEFAULT_ROWS) -> dict:
@@ -1382,13 +1216,9 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
         return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
 
     if hours <= 0 or hours > MAX_HOURS_ANALYZE_ENTITY:
-        return _fail(
-            f"Timespan exceeds allowed window ({MAX_HOURS_ANALYZE_ENTITY}h max)",
-            code="VALIDATION_ERROR",
-            detail=f"got {hours}h",
-        )
+        return _fail(f"Timespan exceeds allowed window ({MAX_HOURS_ANALYZE_ENTITY}h max)",
+                     code="VALIDATION_ERROR", detail=f"got {hours}h")
 
-    # Normalize then detect
     raw_value = value
     value = _normalize_entity_value(value)
     entity_type = detect_entity_type(value)
@@ -1398,13 +1228,9 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
     preferred_domains = _catalog_domains_for_entity(entity_type)
 
     _ensure_catalog_loaded()
-    # NOTE: we intentionally do NOT filter the table_map by catalog presence.
-    # The catalog may be incomplete; we run all relevant queries.
 
-    # Helper for host startswith match (case host has FQDN suffix)
     host_core = safe_value.split(".")[0] if "." in safe_value else safe_value
 
-    # ── Expanded table_map — much richer coverage per entity type ──────────
     table_map = {
         "ip": [
             ("SigninLogs",                    f'IPAddress == "{safe_value}"'),
@@ -1473,7 +1299,6 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
         ],
     }
 
-    # Bumped from 6 → 12 to allow expanded coverage
     raw_queries = table_map.get(entity_type, [])[:12]
 
     tasks = []
@@ -1553,32 +1378,19 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
     })
 
 # ============================================================
-# get_incident_report  &  investigate_incident
-# (entity normalization applied to strip JSON-array wrapping)
+# get_incident_report  (unchanged from previous version)
 # ============================================================
 
-_register_tool_def(
-    "get_incident_report",
-    (
-        "Lists recent Sentinel incidents (no incident_id) or returns a structured SOC report for one. "
-        "With incident_id: returns linked alerts, fully parsed and typed entities (hosts, accounts, IPs, "
-        "URLs, files, processes, registry keys, cloud resources), tactics, techniques, and risk level. "
-        "Entity values are normalized — JSON-array wrapping like [\"name\"] is stripped automatically. "
-        "Use investigate_incident for deeper investigation; run_investigation_checklist for full checklist."
-    ),
-    {
-        "incident_id": "optional: Sentinel incident number or IncidentName",
-        "timespan": "ISO8601 duration like P1D, P7D",
-        "top": "optional: number of incidents to list (default 50, max 200)",
-    },
-)
+_register_tool_def("get_incident_report",
+    ("Lists recent Sentinel incidents (no incident_id) or returns a structured SOC report for one. "
+     "Entity values are normalized — JSON-array wrapping like [\"name\"] is stripped automatically."),
+    {"incident_id": "optional: Sentinel incident number or IncidentName",
+     "timespan": "ISO8601 duration like P1D, P7D",
+     "top": "optional: number of incidents to list (default 50, max 200)"})
 
 @mcp.tool
-def get_incident_report(
-    incident_id: Optional[str] = None,
-    timespan: str = "P7D",
-    top: int = 50,
-) -> dict:
+def get_incident_report(incident_id: Optional[str] = None, timespan: str = "P7D",
+                        top: int = 50) -> dict:
     try:
         hours = parse_timespan_to_hours(timespan)
     except Exception as e:
@@ -1586,7 +1398,6 @@ def get_incident_report(
 
     top = clamp_rows(top)
 
-    # ── MODE 1: LIST INCIDENTS ─────────────────────────────────────────────
     if not incident_id:
         ago_expr = f"{int(hours)}h" if hours.is_integer() else f"{hours}h"
 
@@ -1595,10 +1406,9 @@ SecurityIncident
 | where Severity !~ "Informational"
 | where CreatedTime >= ago({ago_expr})
 | summarize arg_max(LastModifiedTime, *) by IncidentNumber
-| project
-    IncidentNumber, Title, Severity, Status, Owner,
-    CreatedTime, LastModifiedTime, ClosedTime,
-    Classification, ClassificationReason, ClassificationComment
+| project IncidentNumber, Title, Severity, Status, Owner,
+  CreatedTime, LastModifiedTime, ClosedTime,
+  Classification, ClassificationReason, ClassificationComment
 | order by CreatedTime desc
 | take {top}
 """.strip()
@@ -1613,18 +1423,16 @@ SecurityIncident
 
         return _ok({"mode": "list", "count": len(incidents), "incidents": incidents})
 
-    # ── MODE 2: INCIDENT REPORT ────────────────────────────────────────────
     safe_id = escape_kql_string(str(incident_id))
 
     kql_incident = f"""
 SecurityIncident
 | where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
 | summarize arg_max(LastModifiedTime, *) by IncidentNumber
-| project
-    IncidentNumber, Title, Severity, Status, Owner,
-    CreatedTime, LastModifiedTime, ClosedTime,
-    Classification, ClassificationReason, ClassificationComment,
-    AlertIds, Labels, IncidentUrl
+| project IncidentNumber, Title, Severity, Status, Owner,
+  CreatedTime, LastModifiedTime, ClosedTime,
+  Classification, ClassificationReason, ClassificationComment,
+  AlertIds, Labels, IncidentUrl
 """.strip()
 
     res_inc = la_query(kql_incident, timespan)
@@ -1645,39 +1453,15 @@ SecurityIncident
 | join kind=inner (
     SecurityAlert
     | summarize arg_max(TimeGenerated, *) by SystemAlertId
-    | project
-        SystemAlertId,
-        AlertName,
-        AlertSeverity,
-        AlertDescription = Description,
-        AlertStatus     = Status,
-        AlertStartTime  = StartTime,
-        AlertEndTime    = EndTime,
-        ProductName,
-        ProductComponentName,
-        CompromisedEntity,
-        Tactics,
-        Techniques,
-        SubTechniques,
-        AlertLink,
-        Entities
+    | project SystemAlertId, AlertName, AlertSeverity,
+      AlertDescription = Description, AlertStatus = Status,
+      AlertStartTime = StartTime, AlertEndTime = EndTime,
+      ProductName, ProductComponentName, CompromisedEntity,
+      Tactics, Techniques, SubTechniques, AlertLink, Entities
 ) on $left.AlertId == $right.SystemAlertId
-| project
-    AlertId,
-    AlertName,
-    AlertSeverity,
-    AlertDescription,
-    AlertStatus,
-    AlertStartTime,
-    AlertEndTime,
-    ProductName,
-    ProductComponentName,
-    CompromisedEntity,
-    Tactics,
-    Techniques,
-    SubTechniques,
-    AlertLink,
-    Entities
+| project AlertId, AlertName, AlertSeverity, AlertDescription, AlertStatus,
+  AlertStartTime, AlertEndTime, ProductName, ProductComponentName,
+  CompromisedEntity, Tactics, Techniques, SubTechniques, AlertLink, Entities
 """.strip()
 
     res_alerts = la_query(kql_alerts, timespan)
@@ -1698,35 +1482,35 @@ SecurityIncident
 | extend EntityType = tolower(tostring(Entity.Type))
 | where isnotempty(EntityType)
 | extend EntityName = case(
-    EntityType == "host",     tostring(Entity.HostName),
-    EntityType == "account",  coalesce(tostring(Entity.AccountName), tostring(Entity.UserPrincipalName)),
-    EntityType == "ip",       tostring(Entity.Address),
-    EntityType == "process",  tostring(Entity.CommandLine),
-    EntityType == "file",     tostring(Entity.Name),
-    EntityType == "url",      tostring(Entity.Url),
-    EntityType == "dns",      tostring(Entity.DomainName),
+    EntityType == "host", tostring(Entity.HostName),
+    EntityType == "account", coalesce(tostring(Entity.AccountName), tostring(Entity.UserPrincipalName)),
+    EntityType == "ip", tostring(Entity.Address),
+    EntityType == "process", tostring(Entity.CommandLine),
+    EntityType == "file", tostring(Entity.Name),
+    EntityType == "url", tostring(Entity.Url),
+    EntityType == "dns", tostring(Entity.DomainName),
     EntityType == "registrykey", tostring(Entity.Key),
     EntityType == "cloudapplication", tostring(Entity.Name),
     tostring(Entity.Name)
 )
 | where isnotempty(EntityName) and EntityName != "null"
-| extend InternalIp  = iff(EntityType == "host", tostring(Entity.LastIpAddress.Address), "")
-| extend ExternalIp  = iff(EntityType == "host", tostring(Entity.LastExternalIpAddress.Address), "")
-| extend Fqdn        = iff(EntityType == "host", tostring(Entity.FQDN), "")
+| extend InternalIp = iff(EntityType == "host", tostring(Entity.LastIpAddress.Address), "")
+| extend ExternalIp = iff(EntityType == "host", tostring(Entity.LastExternalIpAddress.Address), "")
+| extend Fqdn = iff(EntityType == "host", tostring(Entity.FQDN), "")
 | summarize
-    Hosts          = make_set_if(EntityName, EntityType == "host", 50),
-    Fqdns          = make_set_if(Fqdn, EntityType == "host" and isnotempty(Fqdn) and Fqdn != "null", 50),
-    Accounts       = make_set_if(EntityName, EntityType == "account", 50),
-    IpAddresses    = make_set_if(EntityName, EntityType == "ip", 50),
-    InternalIps    = make_set_if(InternalIp, isnotempty(InternalIp) and InternalIp != "null", 50),
-    ExternalIps    = make_set_if(ExternalIp, isnotempty(ExternalIp) and ExternalIp != "null", 50),
-    Urls           = make_set_if(EntityName, EntityType == "url", 50),
-    Files          = make_set_if(EntityName, EntityType == "file", 50),
-    Processes      = make_set_if(EntityName, EntityType == "process", 50),
-    Domains        = make_set_if(EntityName, EntityType == "dns", 50),
-    RegistryKeys   = make_set_if(EntityName, EntityType == "registrykey", 50),
+    Hosts = make_set_if(EntityName, EntityType == "host", 50),
+    Fqdns = make_set_if(Fqdn, EntityType == "host" and isnotempty(Fqdn) and Fqdn != "null", 50),
+    Accounts = make_set_if(EntityName, EntityType == "account", 50),
+    IpAddresses = make_set_if(EntityName, EntityType == "ip", 50),
+    InternalIps = make_set_if(InternalIp, isnotempty(InternalIp) and InternalIp != "null", 50),
+    ExternalIps = make_set_if(ExternalIp, isnotempty(ExternalIp) and ExternalIp != "null", 50),
+    Urls = make_set_if(EntityName, EntityType == "url", 50),
+    Files = make_set_if(EntityName, EntityType == "file", 50),
+    Processes = make_set_if(EntityName, EntityType == "process", 50),
+    Domains = make_set_if(EntityName, EntityType == "dns", 50),
+    RegistryKeys = make_set_if(EntityName, EntityType == "registrykey", 50),
     CloudResources = make_set_if(EntityName, EntityType in ("cloudapplication", "azureresource"), 50),
-    AllEntities    = make_set(EntityName, 200)
+    AllEntities = make_set(EntityName, 200)
 by IncidentNumber
 """.strip()
 
@@ -1756,7 +1540,7 @@ by IncidentNumber
             "alert_link":         a.get("AlertLink"),
         })
 
-    severity    = (incident.get("Severity") or "").lower()
+    severity = (incident.get("Severity") or "").lower()
     alert_count = len(alerts_structured)
     entity_count = len(entity_row.get("AllEntities") or [])
 
@@ -1775,9 +1559,8 @@ by IncidentNumber
         *entity_row.get("ExternalIps", []),
     })
 
-    # Normalize accounts and hosts (strip JSON-array wrapping etc.)
     accounts_normalized = [_normalize_entity_value(a) for a in entity_row.get("Accounts", [])]
-    hosts_normalized    = [_normalize_entity_value(h) for h in entity_row.get("Hosts", [])]
+    hosts_normalized = [_normalize_entity_value(h) for h in entity_row.get("Hosts", [])]
 
     return _ok({
         "mode": "report",
@@ -1813,20 +1596,27 @@ by IncidentNumber
         "risk_level":             risk,
     })
 
-# ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "investigate_incident",
-    (
-        "Full SOC investigation of a Sentinel incident. Extracts alerts, parses entity lists "
-        "(users, IPs, hosts, domains), builds MITRE timeline, enriches with CMDB, calculates risk. "
-        "Entity values normalized to strip JSON-array wrapping. "
-        "Use get_incident_report for a lighter summary, run_investigation_checklist for full checklist."
-    ),
-    {
-        "incident_id": "Sentinel incident number",
-        "timespan": "ISO8601 duration (P1D, P7D)",
-    },
-)
+# ============================================================
+# investigate_incident  ───  FIX 1 APPLIED
+# ============================================================
+# CHANGES vs previous version:
+#   • Incident query now projects Title (needed by run_investigation_checklist
+#     for keyword-based branch detection).
+#   • Alerts query now projects REAL AlertName (not ProductName). ProductName
+#     is kept in a separate field. This is the root cause of the "cloud"
+#     misrouting bug — the old code aliased AlertName=ProductName which made
+#     every alert_names list contain "Azure Sentinel".
+#   • Return shape includes incident.title and alerts.product_names for
+#     downstream use.
+#   • Techniques/Tactics are flattened via _flatten_mitre_field to undo
+#     Sentinel's JSON-string-in-list encoding (fixes `["[\"T1110\"]"]`).
+
+_register_tool_def("investigate_incident",
+    ("Full SOC investigation of a Sentinel incident. Extracts alerts, parses entity lists, "
+     "builds MITRE timeline, enriches with CMDB, calculates risk. Returns the REAL alert name "
+     "(not ProductName) so downstream branch-detection works correctly."),
+    {"incident_id": "Sentinel incident number",
+     "timespan": "ISO8601 duration (P1D, P7D)"})
 
 @mcp.tool
 def investigate_incident(incident_id: str, timespan: str = "P7D") -> dict:
@@ -1839,19 +1629,19 @@ def investigate_incident(incident_id: str, timespan: str = "P7D") -> dict:
         return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
 
     if hours <= 0 or hours > MAX_HOURS_INCIDENT:
-        return _fail(
-            f"Timespan exceeds allowed window ({MAX_HOURS_INCIDENT}h max)",
-            code="VALIDATION_ERROR",
-            detail=f"got {hours}h",
-        )
+        return _fail(f"Timespan exceeds allowed window ({MAX_HOURS_INCIDENT}h max)",
+                     code="VALIDATION_ERROR", detail=f"got {hours}h")
 
     safe_id = escape_kql_string(str(incident_id))
 
+    # FIX 1a: Project Title so we can use it for branch detection.
     incident_kql = f"""
 SecurityIncident
 | where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
 | where Severity !~ "Informational"
-| project IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime, AlertIds
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| project IncidentNumber, Title, Severity, Status, Owner,
+  CreatedTime, LastModifiedTime, AlertIds
 """.strip()
 
     inc_res = la_query(incident_kql, timespan)
@@ -1873,11 +1663,19 @@ SecurityIncident
 
     if not alert_ids:
         return _ok({
-            "incident": incident,
-            "alerts": [],
+            "incident": {
+                "id":                incident.get("IncidentNumber"),
+                "title":             incident.get("Title"),
+                "severity":          incident.get("Severity"),
+                "status":            incident.get("Status"),
+                "owner":             incident.get("Owner"),
+                "created_time":      incident.get("CreatedTime"),
+                "last_modified_time":incident.get("LastModifiedTime"),
+            },
+            "alerts": {"count": 0, "names": [], "product_names": [], "components": []},
             "entities": {},
             "timeline": {},
-            "mitre": {},
+            "mitre": {"tactics": [], "techniques": []},
             "risk_level": "Low",
             "assessment": "Incident has no linked alerts",
         })
@@ -1885,11 +1683,15 @@ SecurityIncident
     safe_alerts = [escape_kql_string(str(a)) for a in alert_ids if a]
     alert_list = ",".join([f'"{a}"' for a in safe_alerts])
 
+    # FIX 1b: Keep REAL AlertName, don't overwrite with ProductName.
+    # (Previous code did `AlertName = ProductName` which broke branch
+    #  auto-detection because every alert ended up named "Azure Sentinel".)
     alerts_kql = f"""
 SecurityAlert
 | where SystemAlertId in ({alert_list})
 | project
-    AlertName = ProductName,
+    AlertName,
+    ProductName,
     Component = ProductComponentName,
     AlertTime = StartTime,
     Status,
@@ -1950,12 +1752,8 @@ SecurityAlert
                     ips.add(eip["Address"])
 
             elif etype == "account":
-                name = (
-                    e.get("AccountName")
-                    or e.get("UserPrincipalName")
-                    or e.get("Name")
-                    or ""
-                )
+                name = (e.get("AccountName") or e.get("UserPrincipalName")
+                        or e.get("Name") or "")
                 name = _normalize_entity_value(name)
                 if name and name.lower() not in ("system", ""):
                     users.add(name.lower())
@@ -1984,8 +1782,10 @@ SecurityAlert
     first_alert = min(alert_times) if alert_times else None
     last_alert = max(alert_times) if alert_times else None
 
-    tactics = sorted({a.get("Tactics") for a in alerts if a.get("Tactics")})
-    techniques = sorted({a.get("Techniques") for a in alerts if a.get("Techniques")})
+    # FIX 3: Flatten Tactics/Techniques — they come back from Sentinel as
+    # JSON-stringified lists. This undoes `["[\"T1110\"]"]` → `["T1110"]`.
+    tactics = _flatten_mitre_field([a.get("Tactics") for a in alerts])
+    techniques = _flatten_mitre_field([a.get("Techniques") for a in alerts])
 
     cmdb_pivots = list(ips)[:3] + list(hosts)[:3] + list(domains)[:3]
     cmdb_tasks = [
@@ -2039,9 +1839,12 @@ SecurityAlert
             "last_modified_time":incident.get("LastModifiedTime"),
         },
         "alerts": {
-            "count":      len(alerts),
-            "names":      sorted({a.get("AlertName") for a in alerts if a.get("AlertName")}),
-            "components": sorted({a.get("Component") for a in alerts if a.get("Component")}),
+            "count":         len(alerts),
+            # Real alert/rule names — what the auto-detect needs.
+            "names":         sorted({a.get("AlertName") for a in alerts if a.get("AlertName")}),
+            # ProductName preserved separately (informational).
+            "product_names": sorted({a.get("ProductName") for a in alerts if a.get("ProductName")}),
+            "components":    sorted({a.get("Component") for a in alerts if a.get("Component")}),
         },
         "entities": {
             "users":     sorted(users),
@@ -2064,7 +1867,7 @@ SecurityAlert
     })
 
 # ============================================================
-# CHECKLIST DEFINITIONS — universal coverage for every incident type
+# CHECKLIST DEFINITIONS
 # ============================================================
 
 def _checklist_execution(safe_host: str, safe_user: str, ts_short: str, ts_long: str) -> List[dict]:
@@ -2093,7 +1896,6 @@ def _checklist_execution(safe_host: str, safe_user: str, ts_short: str, ts_long:
     ]
 
 def _checklist_identity(safe_user: str, safe_ip: str, safe_host: str, ts_long: str) -> List[dict]:
-    """Identity covers BOTH cloud (Entra) and on-prem AD (group changes, IdentityLogonEvents)."""
     tasks = [
         {"bucket": "signin_logs",        "type": "run_query",    "timespan": "P7D",
          "kql": f'SigninLogs | where UserPrincipalName contains "{safe_user}" or AlternateSignInName contains "{safe_user}" | project TimeGenerated, UserPrincipalName, IPAddress, Location, ResultType, AppDisplayName, ConditionalAccessStatus, DeviceDetail | order by TimeGenerated desc | take 100'},
@@ -2249,9 +2051,7 @@ def _checklist_default(safe_host: str, safe_user: str, safe_ip: str) -> List[dic
         tasks.append({"bucket": "entity_ip",   "type": "analyze_entity", "value": safe_ip,   "timespan": "P7D"})
     return tasks
 
-# ── Site _CL appender (universal) ───────────────────────────────────────
 def _append_site_cl_tasks(tasks: List[dict], safe_host: str) -> List[dict]:
-    """If host maps to a known site, append site-specific Windows/Linux/Cisco _CL queries."""
     if not safe_host:
         return tasks
     site = _detect_site_from_hostname(safe_host)
@@ -2261,46 +2061,99 @@ def _append_site_cl_tasks(tasks: List[dict], safe_host: str) -> List[dict]:
     keep_prefixes = ("Windows", "Linux", "Cisco", "Fortinet", "PaloAlto",
                      "Firepower", "VMware", "Checkpoint", "Zscaler")
     filtered = [t for t in site_tables if any(t.startswith(p) for p in keep_prefixes)]
-    for table in filtered[:6]:  # cap fan-out
+    for table in filtered[:6]:
         tasks.append({
             "bucket": f"site_{table}", "type": "run_query", "timespan": "PT12H",
             "kql": f'{table} | where tostring(*) contains "{safe_host}" | take 30',
         })
     return tasks
 
-# ── Auto-detection — order matters! Identity keywords checked before
-#    execution keywords so "ADAudit | break the glass" routes to identity.
-def _auto_detect_checklist(alert_names: List[str], tactics: List[str]) -> str:
-    combined = " ".join((alert_names or []) + (tactics or [])).lower()
+# ─────────────────────────────────────────────────────────────
+# FIX 2: _auto_detect_checklist — tactic-first shortcut + reordered
+# keyword matching + removed bare "azure" (was matching "Azure Sentinel")
+# ─────────────────────────────────────────────────────────────
+def _auto_detect_checklist(alert_names: List[str], tactics: List[str],
+                            incident_title: str = "") -> str:
+    """
+    Route an incident to the correct checklist branch.
+
+    IMPORTANT ORDER:
+      1. MITRE tactic shortcut (most reliable signal)
+      2. lateral_movement / network / malware (specific tech keywords)
+      3. identity (BEFORE cloud — brute-force/signin/credential are identity)
+      4. cloud (specific phrases only — never bare "azure")
+      5. behavioral / execution
+      6. default
+
+    The incident_title is the PRIMARY source of keywords. The previous
+    code fed in ProductName ("Azure Sentinel") which always matched
+    "azure" → cloud branch. Fixed here.
+    """
+    combined = " ".join(
+        ([incident_title] if incident_title else [])
+        + (alert_names or [])
+        + (tactics or [])
+    ).lower()
+
+    tactics_lower = [str(t).lower() for t in (tactics or [])]
+
+    # ── 1. MITRE tactic shortcut ──────────────────────────────────────
+    # CredentialAccess / InitialAccess strongly signal identity, UNLESS
+    # there's also an endpoint-centric tactic (execution, lateral, etc).
+    if any("credentialaccess" in t or "initialaccess" in t for t in tactics_lower):
+        if not any(t in tactics_lower for t in
+                   ["execution", "lateralmovement", "defenseevasion",
+                    "persistence", "privilegeescalation"]):
+            return "identity"
+
+    # ── 2. Specific technique keywords ────────────────────────────────
     if any(k in combined for k in ["smb", "psexec", "lateral", "dcom", "wmi remote",
                                     "pass-the-hash", "rdp anomaly", "remote services"]):
         return "lateral_movement"
+
     if any(k in combined for k in ["beacon", "c2", "command and control", "dns tunnel",
-                                    "proxy", "outbound anomaly", "exfil"]):
+                                    "proxy anomaly", "outbound anomaly", "exfil"]):
         return "network"
+
     if any(k in combined for k in ["malware", "ransomware", "virus", "trojan",
-                                    "dropper", "hash"]):
+                                    "dropper", "hash match"]):
         return "malware"
-    if any(k in combined for k in ["azure", "storage", "graph api", "service principal",
-                                    "m365", "office", "sharepoint", "exchange"]):
+
+    # ── 3. Identity BEFORE cloud — brute force is identity, not cloud ─
+    if any(k in combined for k in [
+        "brute force", "brute-force", "bruteforce",
+        "signin", "sign-in", "sign in", "login", "logon",
+        "mfa", "credential", "password", "token",
+        "impossible travel", "risky user", "risky sign-in",
+        "valid account", "break the glass", "break-the-glass",
+        "privileged group", "group membership",
+        "adaudit", "ad audit", "account compromise",
+    ]):
+        return "identity"
+
+    # ── 4. Cloud — SPECIFIC phrases only (never bare "azure") ─────────
+    if any(k in combined for k in [
+        "azure activity", "azure resource", "azure storage", "azure vm",
+        "graph api", "service principal sign",
+        "sharepoint", "exchange online", "onedrive",
+        "storage blob", "power automate", "teams admin",
+        "m365 admin", "o365 admin",
+    ]):
         return "cloud"
+
+    # ── 5. Behavioral / execution ─────────────────────────────────────
     if any(k in combined for k in ["anomaly", "ueba", "behavioral", "peer analysis",
                                     "deviation"]):
         return "behavioral"
-    if any(k in combined for k in ["signin", "login", "mfa", "brute", "password",
-                                    "credential", "token", "impossible travel",
-                                    "risky user", "valid account", "break the glass",
-                                    "break-the-glass", "privileged group", "group membership",
-                                    "adaudit", "ad audit"]):
-        return "identity"
+
     if any(k in combined for k in ["powershell", "lolbin", "msbuild", "regsvr32",
                                     "rundll32", "mshta", "certutil", "wmic", "msiexec",
-                                    "execution", "defense evasion", "download"]):
+                                    "execution chain", "defense evasion", "download cradle"]):
         return "execution"
+
     return "default"
 
 def _run_checklist_tasks(tasks: List[dict], timespan: str) -> Dict[str, dict]:
-    """Fan out KQL tasks in parallel; CMDB and analyze_entity run sequentially after."""
     parallel_tasks = []
     entity_tasks   = []
     cmdb_tasks_raw = []
@@ -2335,7 +2188,6 @@ def _run_checklist_tasks(tasks: List[dict], timespan: str) -> Dict[str, dict]:
 
     return results
 
-# ── Bucket summarization with per-bucket truncation ─────────────────────
 HIGH_SIGNAL_BUCKETS = {
     "process_events", "device_events", "network_events", "network_lateral",
     "file_events", "registry_events", "logon_events",
@@ -2347,7 +2199,6 @@ HIGH_SIGNAL_BUCKETS = {
 }
 
 def _summarise_bucket(bucket_id: str, res: dict) -> dict:
-    """Compress a bucket result. High-signal buckets get richer truncation limits."""
     if not res:
         return {"status": "error", "rows": 0, "summary": "null result"}
 
@@ -2361,7 +2212,6 @@ def _summarise_bucket(bucket_id: str, res: dict) -> dict:
 
     data = res.get("data") or {}
 
-    # analyze_entity result shape
     if "entity_type" in data:
         return {
             "status":  "ok" if data.get("tables_hit", 0) > 0 else "ok_empty",
@@ -2373,12 +2223,10 @@ def _summarise_bucket(bucket_id: str, res: dict) -> dict:
             "detail":  data,
         }
 
-    # run_query / la_query result shape
     rows = _la_first_table_dicts(data)
     count = len(rows)
     status = "ok" if count > 0 else "ok_empty"
 
-    # Per-bucket truncation limits
     if bucket_id in HIGH_SIGNAL_BUCKETS or bucket_id.startswith("site_"):
         MAX_SAMPLE_ROWS, MAX_FIELDS_PER_ROW, MAX_VALUE_CHARS = 15, 25, 1500
     else:
@@ -2405,9 +2253,7 @@ def _summarise_bucket(bucket_id: str, res: dict) -> dict:
         "truncated": count > MAX_SAMPLE_ROWS,
     }
 
-# ── Post-checklist host re-enrichment ───────────────────────────────────
 def _scan_for_surfaced_hosts(buckets: Dict[str, dict], known_hosts: List[str]) -> List[str]:
-    """Find hostnames in telemetry samples that weren't in the original entity list."""
     known_lower = {h.lower().split(".")[0] for h in known_hosts if h}
     surfaced = set()
     host_field_candidates = ["DeviceName", "Computer", "HostName", "SourceDevice",
@@ -2420,34 +2266,19 @@ def _scan_for_surfaced_hosts(buckets: Dict[str, dict], known_hosts: List[str]) -
                     vlow = v.lower().split(".")[0]
                     if vlow and vlow not in known_lower and len(vlow) > 3:
                         surfaced.add(v)
-    return sorted(surfaced)[:5]  # cap
+    return sorted(surfaced)[:5]
 
 # ============================================================
-# run_investigation_checklist (orchestrator)
+# run_investigation_checklist  ───  uses all three fixes
 # ============================================================
 
-_register_tool_def(
-    "run_investigation_checklist",
-    (
-        "Executes a parallel server-side batch of telemetry queries for an incident and returns "
-        "compact bucket summaries. Auto-detects checklist branch (execution / identity / "
-        "lateral_movement / network / malware / cloud / behavioral / default) from alert names "
-        "and MITRE tactics. Includes site-specific _CL tables when host prefix matches a known site, "
-        "and re-enriches hosts surfaced in telemetry. "
-        "Does NOT replace get_incident_report (use that for canonical incident metadata) or per-entity "
-        "deep dives via run_query and analyze_entity. "
-        "Buckets returned vary by checklist branch — examples: process_events, network_events, "
-        "file_events, registry_events, device_events, logon_events, security_alerts_30d, "
-        "behavior_analytics, signin_logs, identity_logon, identity_directory, group_changes, "
-        "audit_logs, office_activity, threat_intel, entity_*. Each bucket: status (ok/ok_empty/"
-        "error/skipped), rows, summary string, truncated sample rows."
-    ),
-    {
-        "incident_id":  "Sentinel incident number",
-        "checklist":    "auto | execution | identity | lateral_movement | network | malware | cloud | behavioral | default",
-        "timespan":     "ISO8601 duration, default P7D",
-    },
-)
+_register_tool_def("run_investigation_checklist",
+    ("Executes a parallel server-side batch of telemetry queries for an incident and returns "
+     "compact bucket summaries. Auto-detects checklist branch from incident title + alert names "
+     "+ MITRE tactics (title is the primary source, alert names and tactics are supplementary)."),
+    {"incident_id":  "Sentinel incident number",
+     "checklist":    "auto | execution | identity | lateral_movement | network | malware | cloud | behavioral | default",
+     "timespan":     "ISO8601 duration, default P7D"})
 
 @mcp.tool
 def run_investigation_checklist(
@@ -2473,16 +2304,22 @@ def run_investigation_checklist(
         return inc_res
 
     inc_data    = inc_res.get("data") or {}
+    incident    = inc_data.get("incident") or {}
     ents        = inc_data.get("entities") or {}
     alert_names = list((inc_data.get("alerts") or {}).get("names") or [])
     tactics     = list((inc_data.get("mitre") or {}).get("tactics") or [])
+    techniques  = list((inc_data.get("mitre") or {}).get("techniques") or [])
+
+    # FIX 2 USAGE: Pass incident title to the auto-detect so it can use the
+    # real rule name ("Defender | Euronext | Brute force with result login")
+    # rather than relying on ProductName which is always "Azure Sentinel".
+    incident_title = str(incident.get("title") or "")
 
     hosts   = ents.get("hosts") or []
     users   = ents.get("users") or []
     ips     = ents.get("ips")   or []
     domains = ents.get("domains") or []
 
-    # Normalize entities (strip JSON-array wrapping etc.)
     hosts = [_normalize_entity_value(h) for h in hosts]
     users = [_normalize_entity_value(u) for u in users]
 
@@ -2494,7 +2331,7 @@ def run_investigation_checklist(
 
     cl = (checklist or "auto").strip().lower()
     if cl == "auto":
-        cl = _auto_detect_checklist(alert_names, tactics)
+        cl = _auto_detect_checklist(alert_names, tactics, incident_title=incident_title)
 
     ts_short = "PT12H"
     ts_long  = "P1D"
@@ -2516,7 +2353,6 @@ def run_investigation_checklist(
     else:
         tasks = _checklist_default(safe_host, safe_user, safe_ip)
 
-    # Universal: append site-specific _CL queries when host prefix matches
     tasks = _append_site_cl_tasks(tasks, safe_host)
 
     raw_results = _run_checklist_tasks(tasks, timespan)
@@ -2526,7 +2362,6 @@ def run_investigation_checklist(
         bid = task["bucket"]
         buckets[bid] = _summarise_bucket(bid, raw_results.get(bid))
 
-    # Escalation trigger scan across security_alerts_30d
     escalation_triggers = []
     sa_bucket = buckets.get("security_alerts_30d", {})
     if sa_bucket.get("status") == "ok":
@@ -2543,7 +2378,6 @@ def run_investigation_checklist(
                         "time":    row.get("TimeGenerated"),
                     })
 
-    # Sparse-bucket auto-expansion (PT12H → P1D)
     expanded_buckets = []
     for bid in ["process_events", "file_events", "registry_events",
                 "device_events", "logon_events"]:
@@ -2554,8 +2388,6 @@ def run_investigation_checklist(
                 buckets[f"{bid}_expanded"] = _summarise_bucket(f"{bid}_expanded", exp_res)
                 expanded_buckets.append(bid)
 
-    # Post-checklist: scan for hosts that surfaced in telemetry but weren't
-    # in the original entity list, and run CMDB on them.
     surfaced_hosts = _scan_for_surfaced_hosts(buckets, hosts)
     surfaced_cmdb = []
     for sh in surfaced_hosts:
@@ -2569,6 +2401,7 @@ def run_investigation_checklist(
 
     return _ok({
         "incident_id":          incident_id,
+        "incident_title":       incident_title,
         "checklist_used":       cl,
         "checklist_auto":       checklist == "auto",
         "site_detected":        site_detected,
@@ -2583,7 +2416,7 @@ def run_investigation_checklist(
         },
         "mitre": {
             "tactics":    tactics,
-            "techniques": list((inc_data.get("mitre") or {}).get("techniques") or []),
+            "techniques": techniques,
         },
         "telemetry":            buckets,
         "escalation_triggers":  escalation_triggers,
@@ -2599,18 +2432,11 @@ def run_investigation_checklist(
     })
 
 # ─────────────────────────────────────────────────────────────
-_register_tool_def(
-    "get_similar_incident_history",
-    (
-        "Looks up prior Sentinel incidents over the last N days that share the same title. "
-        "Returns classification history, status breakdown, owner. Useful for triage of recurring "
-        "false positives. Tries exact normalized title match first, falls back to contains match."
-    ),
-    {
-        "incident_id": "Sentinel incident number",
-        "days": "optional integer 1–90, default 30",
-    },
-)
+_register_tool_def("get_similar_incident_history",
+    ("Looks up prior Sentinel incidents over the last N days that share the same title. "
+     "Returns classification history, status breakdown, owner."),
+    {"incident_id": "Sentinel incident number",
+     "days": "optional integer 1–90, default 30"})
 
 @mcp.tool
 def get_similar_incident_history(incident_id: str, days: int = 30) -> dict:

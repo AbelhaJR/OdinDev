@@ -2871,15 +2871,48 @@ def run_investigation_checklist(
     for dom in (domains or [])[:IOC_MAX_DOMAINS_PER_INCIDENT]:
         _add_ioc(dom, "domain")
 
-    # Hashes — look for hash-shaped strings in entities.files or .processes
-    # (rarely surfaced for this kind of incident, but safe to try)
+    # Hashes — look in three places:
+    #   1. Incident entity list (entities.files, entities.processes)
+    #   2. Telemetry sample rows (SHA256, SHA1, MD5, InitiatingProcessSHA256, etc.)
+    #   3. Alert entity JSON (FileHash type entities)
+    # This ensures hashes from DeviceProcessEvents, DeviceFileEvents, etc. get enriched.
     hashes_found: List[Tuple[str, str]] = []
+    _seen_hashes: set = set()
+
+    def _collect_hash(val: str):
+        if not val or not isinstance(val, str):
+            return
+        v = val.strip()
+        if v.lower() in _seen_hashes:
+            return
+        t = _detect_ioc_type(v)
+        if t in ("sha256", "sha1", "md5"):
+            _seen_hashes.add(v.lower())
+            hashes_found.append((v, t))
+
+    # Source 1: entity list
     for entity_list in [(ents.get("files") or []),
                         (ents.get("processes") or [])]:
         for v in entity_list:
-            t = _detect_ioc_type(str(v))
-            if t in ("sha256", "sha1", "md5"):
-                hashes_found.append((str(v), t))
+            _collect_hash(str(v))
+
+    # Source 2: telemetry samples — scan for known hash column names
+    hash_fields = [
+        "SHA256", "SHA1", "MD5",
+        "InitiatingProcessSHA256", "InitiatingProcessSHA1", "InitiatingProcessMD5",
+        "FileHashSha256", "FileHashSha1", "FileHashMd5",
+        "FileSHA256",
+    ]
+    for bid, b in buckets.items():
+        for row in (b.get("sample") or []):
+            for f in hash_fields:
+                v = row.get(f)
+                if v:
+                    _collect_hash(str(v))
+        # Stop scanning once we have enough candidates
+        if len(hashes_found) >= IOC_MAX_HASHES_PER_INCIDENT * 3:
+            break
+
     for h, ht in hashes_found[:IOC_MAX_HASHES_PER_INCIDENT]:
         _add_ioc(h, ht)
 

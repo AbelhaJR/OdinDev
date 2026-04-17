@@ -267,9 +267,56 @@ def _fail(message: str, *, code: Optional[str] = None, status_code: Optional[int
 # ============================================================
 
 _TOOL_DEFS: List[dict] = []
+_HIDDEN_TOOLS: set = set()
 
-def _register_tool_def(name: str, description: str, params: dict) -> None:
+# ── Tool visibility gates ──────────────────────────────────────────────
+# Reduces the tool schema bloat injected into small-context models (e.g.
+# gpt-5.2-chat, 128K). Debug/admin tools are suppressed by default.
+#
+# To re-enable, set env vars in the Function App:
+#   MCP_EXPOSE_DEBUG_TOOLS=true   ← ping, debug_*, get_tools
+#   MCP_EXPOSE_ADMIN_TOOLS=true   ← list_analytics_rules, analyze_use_case,
+#                                    generate_confluence_use_case,
+#                                    get_workspace_table_catalog
+EXPOSE_DEBUG_TOOLS = os.environ.get("MCP_EXPOSE_DEBUG_TOOLS", "false").lower() == "true"
+EXPOSE_ADMIN_TOOLS = os.environ.get("MCP_EXPOSE_ADMIN_TOOLS", "false").lower() == "true"
+
+
+def _register_tool_def(name: str, description: str, params: dict,
+                        *, group: str = "core") -> None:
+    """
+    Register a tool in _TOOL_DEFS unless its group is disabled by env var.
+    Groups:
+      - "core"  : always registered (default)
+      - "debug" : only if MCP_EXPOSE_DEBUG_TOOLS=true
+      - "admin" : only if MCP_EXPOSE_ADMIN_TOOLS=true
+
+    Tools whose metadata is suppressed also go into _HIDDEN_TOOLS so the
+    @_expose decorator can skip @mcp.tool registration entirely — which
+    prevents the tool schema from being sent to the model client.
+    """
+    if group == "debug" and not EXPOSE_DEBUG_TOOLS:
+        _HIDDEN_TOOLS.add(name)
+        return
+    if group == "admin" and not EXPOSE_ADMIN_TOOLS:
+        _HIDDEN_TOOLS.add(name)
+        return
     _TOOL_DEFS.append({"name": name, "description": description, "params": params})
+
+
+def _expose(name: str):
+    """
+    Conditional decorator — registers the function as an MCP tool only if
+    its name is not in _HIDDEN_TOOLS. Used on debug/admin tools so they
+    stop consuming context in the tool schema list when disabled.
+
+    Core tools continue to use @mcp.tool directly.
+    """
+    def decorator(fn):
+        if name in _HIDDEN_TOOLS:
+            return fn  # Not exposed as an MCP tool
+        return mcp.tool(fn)
+    return decorator
 
 # ============================================================
 # MANAGED IDENTITY
@@ -1357,17 +1404,19 @@ def _enrich_iocs_parallel(iocs: List[Tuple[str, str]],
 
 _register_tool_def("get_tools",
     ("Returns the full list of available MCP tools with their parameter formats. "
-     "Call this first if you are unsure which tool to use for a task."), {})
+     "Call this first if you are unsure which tool to use for a task."), {},
+    group="debug")
 
-@mcp.tool
+@_expose("get_tools")
 def get_tools() -> dict:
     return _ok({"tools": _TOOL_DEFS, "mcp_path": "/mcp"})
 
 _register_tool_def("ping",
     ("Connectivity and configuration health check. Does not query Sentinel. "
-     "Use this to verify the MCP endpoint is reachable and the workspace is configured."), {})
+     "Use this to verify the MCP endpoint is reachable and the workspace is configured."), {},
+    group="debug")
 
-@mcp.tool
+@_expose("ping")
 def ping() -> dict:
     return _ok({
         "message": "pong",
@@ -1377,9 +1426,10 @@ def ping() -> dict:
     })
 
 _register_tool_def("debug_identity",
-    "Shows whether managed identity environment variables are present.", {})
+    "Shows whether managed identity environment variables are present.", {},
+    group="debug")
 
-@mcp.tool
+@_expose("debug_identity")
 def debug_identity() -> dict:
     return _ok({
         "IDENTITY_ENDPOINT_present": bool(os.environ.get("IDENTITY_ENDPOINT")),
@@ -1390,9 +1440,10 @@ def debug_identity() -> dict:
     })
 
 _register_tool_def("get_workspace_table_catalog",
-    "Returns all workspace tables grouped by telemetry domain.", {})
+    "Returns all workspace tables grouped by telemetry domain.", {},
+    group="admin")
 
-@mcp.tool
+@_expose("get_workspace_table_catalog")
 def get_workspace_table_catalog() -> dict:
     _ensure_catalog_loaded()
     if not WORKSPACE_TABLE_CATALOG:
@@ -1400,9 +1451,10 @@ def get_workspace_table_catalog() -> dict:
     return _ok({"catalog": WORKSPACE_TABLE_CATALOG})
 
 _register_tool_def("debug_catalog_loaded",
-    "Returns whether the workspace catalog JSON loaded successfully and which domain keys are present.", {})
+    "Returns whether the workspace catalog JSON loaded successfully and which domain keys are present.", {},
+    group="debug")
 
-@mcp.tool
+@_expose("debug_catalog_loaded")
 def debug_catalog_loaded() -> dict:
     _ensure_catalog_loaded()
     return _ok({
@@ -1557,9 +1609,10 @@ SecurityAlert
 
 _register_tool_def("list_analytics_rules",
     "Lists Microsoft Sentinel analytics rules.",
-    {"top": "optional int, max rules to return (default 50, hard cap 200)"})
+    {"top": "optional int, max rules to return (default 50, hard cap 200)"},
+    group="admin")
 
-@mcp.tool
+@_expose("list_analytics_rules")
 def list_analytics_rules(top: int = 50) -> dict:
     if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
         return _fail("SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
@@ -1597,9 +1650,10 @@ _register_tool_def("analyze_use_case",
     ("Fetches a Sentinel analytic rule by rule_id or rule_name and extracts documentation-ready "
      "key points."),
     {"rule_id": "optional: analytic rule ARM resource name/GUID",
-     "rule_name": "optional: displayName exact match (case-insensitive)"})
+     "rule_name": "optional: displayName exact match (case-insensitive)"},
+    group="admin")
 
-@mcp.tool
+@_expose("analyze_use_case")
 def analyze_use_case(rule_id: Optional[str] = None, rule_name: Optional[str] = None) -> dict:
     if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
         return _fail("SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME not configured",
@@ -1656,9 +1710,10 @@ def analyze_use_case(rule_id: Optional[str] = None, rule_name: Optional[str] = N
 _register_tool_def("generate_confluence_use_case",
     "Generates a Confluence-ready HTML documentation page for a Sentinel analytic rule.",
     {"rule_id": "optional: analytic rule ARM resource name/GUID",
-     "rule_name": "optional: displayName exact match (case-insensitive)"})
+     "rule_name": "optional: displayName exact match (case-insensitive)"},
+    group="admin")
 
-@mcp.tool
+@_expose("generate_confluence_use_case")
 def generate_confluence_use_case(rule_id: Optional[str] = None,
                                   rule_name: Optional[str] = None) -> dict:
     if not SUBSCRIPTION_ID or not RESOURCE_GROUP or not WORKSPACE_NAME:
@@ -3503,7 +3558,16 @@ HIGH_SIGNAL_BUCKETS = {
     "anomalies",
 }
 
-def _summarise_bucket(bucket_id: str, res: dict) -> dict:
+def _summarise_bucket(bucket_id: str, res: dict, compact: bool = False) -> dict:
+    """
+    Shape a query result into a compact per-bucket summary.
+
+    When compact=True (used by run_investigation_checklist(compact=true)),
+    sample rows, field counts, and value lengths are aggressively trimmed
+    so the full response fits in a 128K-context model like gpt-5.2-chat.
+    Set compact=False (default) for the richest output when model context
+    is not a constraint.
+    """
     if not res:
         return {"status": "error", "rows": 0, "summary": "null result"}
 
@@ -3518,43 +3582,62 @@ def _summarise_bucket(bucket_id: str, res: dict) -> dict:
     data = res.get("data") or {}
 
     if "entity_type" in data:
-        return {
+        out = {
             "status":  "ok" if data.get("tables_hit", 0) > 0 else "ok_empty",
             "rows":    data.get("total_events", 0),
             "summary": (f"entity_type={data.get('entity_type')} "
                         f"risk={data.get('risk_level')} "
                         f"tables_hit={data.get('tables_hit')} "
                         f"events={data.get('total_events')}"),
-            "detail":  data,
         }
+        # Only include the heavy `detail` payload in non-compact mode
+        if not compact:
+            out["detail"] = data
+        else:
+            # Compact: keep only the tables_hit list (rows are hit counts,
+            # which is all the analyst needs for a telemetry table row).
+            out["tables_hit_detail"] = [
+                {"table": r.get("table"), "count": r.get("count")}
+                for r in (data.get("results") or [])
+            ][:10]
+        return out
 
     rows = _la_first_table_dicts(data)
     count = len(rows)
     status = "ok" if count > 0 else "ok_empty"
 
-    if bucket_id in HIGH_SIGNAL_BUCKETS or bucket_id.startswith("site_"):
-        MAX_SAMPLE_ROWS, MAX_FIELDS_PER_ROW, MAX_VALUE_CHARS = 15, 25, 1500
+    # Sample/field/value budgets
+    if compact:
+        # Tight budgets — fits comfortably inside 128K context
+        if bucket_id in HIGH_SIGNAL_BUCKETS or bucket_id.startswith("site_"):
+            MAX_SAMPLE_ROWS, MAX_FIELDS_PER_ROW, MAX_VALUE_CHARS = 5, 10, 300
+        else:
+            MAX_SAMPLE_ROWS, MAX_FIELDS_PER_ROW, MAX_VALUE_CHARS = 3, 8, 200
     else:
-        MAX_SAMPLE_ROWS, MAX_FIELDS_PER_ROW, MAX_VALUE_CHARS = 5, 15, 500
+        # Rich budgets — the original non-compact behavior
+        if bucket_id in HIGH_SIGNAL_BUCKETS or bucket_id.startswith("site_"):
+            MAX_SAMPLE_ROWS, MAX_FIELDS_PER_ROW, MAX_VALUE_CHARS = 15, 25, 1500
+        else:
+            MAX_SAMPLE_ROWS, MAX_FIELDS_PER_ROW, MAX_VALUE_CHARS = 5, 15, 500
 
     def _truncate_value(v):
         if isinstance(v, str) and len(v) > MAX_VALUE_CHARS:
             return v[:MAX_VALUE_CHARS] + "...[truncated]"
         return v
 
-    compact = []
+    sample_out = []
     for r in rows[:MAX_SAMPLE_ROWS]:
         kept = {k: _truncate_value(v) for k, v in r.items() if v not in (None, "", [])}
         if len(kept) > MAX_FIELDS_PER_ROW:
             kept = dict(list(kept.items())[:MAX_FIELDS_PER_ROW])
             kept["_truncated_fields"] = True
-        compact.append(kept)
+        sample_out.append(kept)
 
     return {
         "status":    status,
         "rows":      count,
         "summary":   f"{count} rows returned",
-        "sample":    compact,
+        "sample":    sample_out,
         "truncated": count > MAX_SAMPLE_ROWS,
     }
 
@@ -3606,19 +3689,26 @@ def enrich_ioc(value: str, value_type: Optional[str] = None) -> dict:
 
 _register_tool_def("run_investigation_checklist",
     ("Executes a parallel server-side batch of telemetry queries for an incident and returns "
-     "compact bucket summaries. Auto-detects checklist branch from incident title + alert names "
-     "+ MITRE tactics (title is the primary source, alert names and tactics are supplementary). "
-     "Also auto-enriches primary IOCs: IPs go to AbuseIPDB; domains and hashes go to VirusTotal. "
-     "Escalates the incident if any IOC scores above threshold."),
+     "bucket summaries. Auto-detects checklist branch from incident title + alert names + "
+     "MITRE tactics (title is the primary source). Also auto-enriches primary IOCs: IPs go "
+     "to AbuseIPDB; domains and hashes go to VirusTotal. Escalates the incident if any IOC "
+     "scores above threshold.\n"
+     "\n"
+     "compact=true (default false): aggressively trims sample rows, field counts, value "
+     "lengths, and IOC/CMDB detail fields so the full response fits in a 128K-context model "
+     "(e.g. gpt-5.2-chat). Use compact mode when your client model context is limited; use "
+     "the default rich mode for 200K+ models (Claude, gpt-5, gpt-5.1, gpt-5.2 non-chat)."),
     {"incident_id":  "Sentinel incident number",
      "checklist":    "auto | execution | identity | lateral_movement | network | malware | cloud | behavioral | default",
-     "timespan":     "ISO8601 duration, default P7D"})
+     "timespan":     "ISO8601 duration, default P7D",
+     "compact":      "bool, default false. Set true to trim response size for small-context models."})
 
 @mcp.tool
 def run_investigation_checklist(
     incident_id: str,
     checklist: str = "auto",
     timespan: str = "P7D",
+    compact: bool = False,
 ) -> dict:
     if not incident_id:
         return _fail("incident_id is required", code="VALIDATION_ERROR")
@@ -3693,7 +3783,7 @@ def run_investigation_checklist(
     buckets: Dict[str, dict] = {}
     for task in tasks:
         bid = task["bucket"]
-        buckets[bid] = _summarise_bucket(bid, raw_results.get(bid))
+        buckets[bid] = _summarise_bucket(bid, raw_results.get(bid), compact=compact)
 
     escalation_triggers = []
     sa_bucket = buckets.get("security_alerts_30d", {})
@@ -3718,7 +3808,9 @@ def run_investigation_checklist(
             expand_task = next((t for t in tasks if t["bucket"] == bid), None)
             if expand_task and expand_task.get("type") == "run_query":
                 exp_res = la_query(expand_task["kql"], "P1D")
-                buckets[f"{bid}_expanded"] = _summarise_bucket(f"{bid}_expanded", exp_res)
+                buckets[f"{bid}_expanded"] = _summarise_bucket(
+                    f"{bid}_expanded", exp_res, compact=compact
+                )
                 expanded_buckets.append(bid)
 
     surfaced_hosts = _scan_for_surfaced_hosts(buckets, hosts)
@@ -3728,7 +3820,21 @@ def run_investigation_checklist(
         if res.get("ok"):
             rows = _la_first_table_dicts(res["data"])
             if rows:
-                surfaced_cmdb.append({"host": sh, "cmdb_rows": len(rows), "sample": rows[:3]})
+                # In compact mode: keep only row count + first hit with top fields.
+                # Full mode: keep top 3 rows verbatim (original behavior).
+                if compact:
+                    top_row = rows[0]
+                    trimmed = {k: v for k, v in top_row.items()
+                               if k in ("Key", "FQDN", "BusinessEntity",
+                                        "Management_IP", "logsource", "PSNC")
+                               and v not in (None, "", [])}
+                    surfaced_cmdb.append({
+                        "host": sh, "cmdb_rows": len(rows), "top": trimmed
+                    })
+                else:
+                    surfaced_cmdb.append({
+                        "host": sh, "cmdb_rows": len(rows), "sample": rows[:3]
+                    })
 
     site_detected = _detect_site_from_hostname(safe_host) if safe_host else None
 
@@ -3835,11 +3941,42 @@ def run_investigation_checklist(
 
     # Run enrichment in parallel (rate-limited per provider internally)
     ioc_enrichment: Dict[str, dict] = {}
+
+    def _compact_ioc_data(d: dict) -> dict:
+        """
+        Strip bulky/debug-ish fields from an IOC enrichment dict. Keeps
+        only the fields analysts actually reference in reports.
+        """
+        if not isinstance(d, dict):
+            return d
+        out = {"ioc": d.get("ioc"), "ioc_type": d.get("ioc_type"),
+               "verdict": d.get("verdict"), "escalate": d.get("escalate")}
+        vt = d.get("virustotal")
+        if isinstance(vt, dict):
+            out["virustotal"] = {
+                k: vt.get(k) for k in (
+                    "provider", "status", "malicious_engines",
+                    "suspicious_engines", "as_owner", "country",
+                    "gui_link", "reason", "error"
+                ) if vt.get(k) is not None
+            }
+        ab = d.get("abuseipdb")
+        if isinstance(ab, dict):
+            out["abuseipdb"] = {
+                k: ab.get(k) for k in (
+                    "provider", "status", "abuse_confidence_score",
+                    "total_reports", "country_code", "isp", "usage_type",
+                    "is_tor", "gui_link", "error"
+                ) if ab.get(k) is not None
+            }
+        return out
+
     if ioc_list and (_VT_API_KEYS or ABUSEIPDB_API_KEY):
         enrichment_raw = _enrich_iocs_parallel(ioc_list, max_workers=4)
         for key, res in enrichment_raw.items():
             if res.get("ok"):
-                ioc_enrichment[key] = res["data"]
+                data = res["data"]
+                ioc_enrichment[key] = _compact_ioc_data(data) if compact else data
             else:
                 ioc_enrichment[key] = {
                     "ioc": key,
@@ -3895,6 +4032,7 @@ def run_investigation_checklist(
         "incident_title":       incident_title,
         "checklist_used":       cl,
         "checklist_auto":       checklist == "auto",
+        "compact":              compact,
         "site_detected":        site_detected,
         "entities_extracted": {
             "hosts":        hosts,

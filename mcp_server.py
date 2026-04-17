@@ -2512,6 +2512,291 @@ def _entity_dedup_key(normalized_type: str, fields: dict) -> str:
     # Fallback: hash-ish of all values
     return f"{normalized_type}::{_low(json.dumps(fields, sort_keys=True, default=str))[:300]}"
 
+
+# ============================================================
+# Shared entity extraction pipeline
+# ============================================================
+# Used by both investigate_incident and get_incident_entities so there's
+# exactly one place where Sentinel's $id/$ref JSON gets materialized and
+# walked. Any future fix to entity parsing only needs to happen here.
+
+# Well-known local/service machine accounts. These appear in every MDE
+# endpoint alert (every Windows process runs as one of them at some point)
+# but are NOT actionable identity pivots. They must NOT leak into the
+# `users` list that drives checklist branch detection — otherwise every
+# endpoint incident would trip the identity branch the moment we started
+# surfacing nested Process.Account entities.
+_LOCAL_ACCOUNT_NAMES = {
+    "system", "local service", "network service",
+    "localsystem", "local system", "anonymous logon",
+    "dwm", "umfd",  # Desktop Window Manager, User-Mode Font Driver
+}
+_LOCAL_ACCOUNT_DOMAINS = {"nt authority", "builtin", "font driver host",
+                           "window manager"}
+# S-1-5-18: LocalSystem, S-1-5-19: LocalService, S-1-5-20: NetworkService
+_LOCAL_ACCOUNT_SIDS = {"S-1-5-18", "S-1-5-19", "S-1-5-20"}
+
+
+def _is_local_account(fields: dict) -> bool:
+    """
+    Return True for well-known local/service accounts (SYSTEM, LOCAL SERVICE,
+    NETWORK SERVICE, ANONYMOUS LOGON, DWM-*, UMFD-*).
+
+    These accounts appear in MDE alerts because every process runs as one of
+    them at some point — they are not actionable identity pivots and must be
+    excluded from the `users` list used for pivot analysis and checklist
+    branch detection. They remain visible in the entity inventory.
+    """
+    sid = (fields.get("sid") or "").strip().upper()
+    if sid in _LOCAL_ACCOUNT_SIDS:
+        return True
+
+    name      = (fields.get("name") or "").strip().lower()
+    upn       = (fields.get("upn")  or "").strip().lower()
+    disp      = (fields.get("display_name") or "").strip().lower()
+    nt_domain = (fields.get("nt_domain") or "").strip().lower()
+
+    # Direct match on name or UPN
+    if name in _LOCAL_ACCOUNT_NAMES or upn in _LOCAL_ACCOUNT_NAMES:
+        return True
+
+    # Domain\Name form with a machine-local domain
+    if nt_domain in _LOCAL_ACCOUNT_DOMAINS and name in _LOCAL_ACCOUNT_NAMES:
+        return True
+
+    # display_name in "NT AUTHORITY\SYSTEM" form
+    for d in _LOCAL_ACCOUNT_DOMAINS:
+        for n in _LOCAL_ACCOUNT_NAMES:
+            if disp == f"{d}\\{n}":
+                return True
+
+    # DWM-N and UMFD-N virtual accounts (indexed session accounts)
+    if re.fullmatch(r"(dwm|umfd)-\d+", name):
+        return True
+
+    return False
+
+
+def _extract_all_entities_from_alerts(alerts: List[dict],
+                                      snapshot_raw: bool = False) -> dict:
+    """
+    Canonical entity-extraction pipeline shared by investigate_incident and
+    get_incident_entities. For each alert dict (must carry an `Entities`
+    field, either as a JSON string or already-parsed list):
+
+      1. Parse Entities JSON
+      2. Build a $id → node map across the ENTIRE tree (any depth)
+      3. Resolve every $ref at any depth (in-place mutation)
+      4. Collect every Type-tagged dict recursively (any depth)
+      5. Run through _ENTITY_EXTRACTORS for structured per-type fields
+      6. Dedup across alerts via _entity_dedup_key + field merge
+
+    The caller decides what to do with the resulting rich entity map —
+    flatten into string sets (investigate_incident) or shape into the
+    grouped-by-type view (get_incident_entities).
+
+    Args:
+      alerts:        list of alert dicts from SecurityAlert projection.
+                     Each should carry 'SystemAlertId', 'AlertName',
+                     'TimeGenerated' (or 'StartTime' / 'AlertTime'), and
+                     'Entities'.
+      snapshot_raw:  if True, deep-copies each alert's Entities BEFORE
+                     mutation so callers can expose the original shape
+                     (used by get_incident_entities with include_raw=true).
+
+    Returns:
+      {
+        "merged":        dict keyed by _entity_dedup_key → entity record
+                          { "type", "raw_type", "fields",
+                            "seen_in_alerts": set[str],
+                            "first_alert_time": str|None },
+        "parse_errors":  int,
+        "unknown_types": dict[str, int] — entity types with no extractor,
+        "raw_snapshots": list of {alert_id, alert_name, entities} (if snapshot_raw),
+      }
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    parse_errors = 0
+    unknown_types: Dict[str, int] = {}
+    raw_snapshots: List[Dict[str, Any]] = []
+
+    for alert in alerts:
+        alert_id = alert.get("SystemAlertId") or alert.get("AlertId")
+        alert_nm = alert.get("AlertName")
+        alert_tm = (alert.get("TimeGenerated") or alert.get("AlertTime")
+                    or alert.get("StartTime"))
+        entities_raw = alert.get("Entities")
+
+        if not entities_raw:
+            continue
+
+        if isinstance(entities_raw, str):
+            try:
+                parsed = json.loads(entities_raw)
+            except Exception:
+                parse_errors += 1
+                continue
+        else:
+            parsed = entities_raw
+
+        if not isinstance(parsed, list):
+            continue
+
+        if snapshot_raw:
+            # Deep copy via JSON round-trip BEFORE we mutate in place
+            raw_snapshots.append({
+                "alert_id":   alert_id,
+                "alert_name": alert_nm,
+                "entities":   json.loads(json.dumps(parsed, default=str)),
+            })
+
+        # Three-pass pipeline: build → resolve → collect
+        id_map = _build_id_map(parsed)
+        _resolve_refs_in_place(parsed, id_map)
+        collected = _collect_typed_entities(parsed)
+
+        # Extract + dedup into merged dict
+        for e in collected:
+            if not isinstance(e, dict):
+                continue
+            etype = (e.get("Type") or "").lower()
+            if not etype:
+                continue
+
+            handler = _ENTITY_EXTRACTORS.get(etype)
+            if handler:
+                normalized_type, extractor = handler
+                fields = extractor(e)
+            else:
+                normalized_type = etype.replace("-", "_")
+                fields = _extract_generic_fields(e)
+                unknown_types[etype] = unknown_types.get(etype, 0) + 1
+
+            # Strip empty values
+            fields = {k: v for k, v in fields.items()
+                      if v not in (None, "", [], {})}
+
+            if not fields:
+                continue
+
+            key = _entity_dedup_key(normalized_type, fields)
+            if key in merged:
+                if alert_id:
+                    merged[key]["seen_in_alerts"].add(str(alert_id))
+                # Merge new non-empty fields we didn't have yet
+                for fk, fv in fields.items():
+                    if fk not in merged[key]["fields"] and fv not in (None, "", [], {}):
+                        merged[key]["fields"][fk] = fv
+            else:
+                merged[key] = {
+                    "type":             normalized_type,
+                    "raw_type":         etype,
+                    "fields":           fields,
+                    "seen_in_alerts":   {str(alert_id)} if alert_id else set(),
+                    "first_alert_time": alert_tm,
+                }
+
+    return {
+        "merged":        merged,
+        "parse_errors":  parse_errors,
+        "unknown_types": unknown_types,
+        "raw_snapshots": raw_snapshots,
+    }
+
+
+def _flatten_entities_to_string_sets(entity_map: Dict[str, Dict[str, Any]]) -> dict:
+    """
+    Given the rich entity map from _extract_all_entities_from_alerts, flatten
+    into the simple string-set shape that investigate_incident has always
+    returned. Additionally surfaces `hashes` and `local_accounts` which the
+    old hand-rolled extraction couldn't produce (because it didn't recurse
+    into FileHashes[] or Process.Account).
+
+    Returns:
+      {
+        "users":          sorted list of user UPNs/display names (LOCAL accts filtered),
+        "ips":            sorted list of IP address strings,
+        "hosts":          sorted list of hostnames / FQDNs,
+        "domains":        sorted list of DNS domain names,
+        "processes":      sorted list of process command lines (truncated 200),
+        "files":          sorted list of file names,
+        "hashes":         sorted list of hash values (sha256/sha1/md5) — NEW,
+        "local_accounts": sorted list of machine-local accounts (SYSTEM etc.) — NEW,
+      }
+    """
+    users: set = set()
+    ips: set = set()
+    hosts: set = set()
+    domains: set = set()
+    processes: set = set()
+    files: set = set()
+    hashes: set = set()
+    local_accounts: set = set()
+
+    for entry in entity_map.values():
+        t = entry["type"]
+        f = entry["fields"]
+
+        if t == "host":
+            name = (f.get("fqdn") or f.get("hostname") or "").strip()
+            if name:
+                hosts.add(_normalize_entity_value(name).lower())
+
+        elif t == "account":
+            if _is_local_account(f):
+                # Still visible, but separated from actionable user list
+                local = (f.get("display_name") or f.get("name")
+                         or f.get("upn") or "").strip()
+                if local:
+                    local_accounts.add(local)
+                continue
+            name = (f.get("upn") or f.get("display_name")
+                    or f.get("name") or "").strip()
+            name = _normalize_entity_value(name)
+            if name:
+                users.add(name.lower())
+
+        elif t == "ip":
+            addr = f.get("address")
+            if addr:
+                ips.add(addr)
+
+        elif t == "dns":
+            d = f.get("domain_name")
+            if d:
+                domains.add(d.lower())
+
+        elif t == "process":
+            cmd = f.get("command_line")
+            if cmd:
+                processes.add(cmd[:200])
+
+        elif t == "file":
+            fname = f.get("name")
+            if fname:
+                files.add(fname)
+            # File can carry nested hashes inline — capture them too
+            for h in (f.get("hashes") or []):
+                if isinstance(h, dict) and h.get("value"):
+                    hashes.add(h["value"])
+
+        elif t == "filehash":
+            val = f.get("value")
+            if val:
+                hashes.add(val)
+
+    return {
+        "users":          sorted(users),
+        "ips":            sorted(ips),
+        "hosts":          sorted(hosts),
+        "domains":        sorted(domains),
+        "processes":      sorted(processes),
+        "files":          sorted(files),
+        "hashes":         sorted(hashes),
+        "local_accounts": sorted(local_accounts),
+    }
+
+
 _register_tool_def("get_incident_entities",
     ("Returns the COMPLETE entity inventory extracted from every alert linked to a "
      "Sentinel incident. More thorough than get_incident_report / investigate_incident: "
@@ -2600,91 +2885,16 @@ SecurityAlert
 
     alerts = _la_first_table_dicts(alerts_res["data"])
 
-    # Step 3: parse + resolve + extract
-    # Key: dedup_key → {type, fields, seen_in_alerts, first_seen_time}
-    merged: Dict[str, Dict[str, Any]] = {}
-    raw_per_alert: List[Dict[str, Any]] = []
-    unknown_types: Dict[str, int] = {}
-    parse_errors = 0
-
-    for alert in alerts:
-        alert_id  = alert.get("SystemAlertId")
-        alert_nm  = alert.get("AlertName")
-        alert_tm  = alert.get("TimeGenerated")
-        entities_raw = alert.get("Entities")
-
-        if not entities_raw:
-            continue
-
-        # Parse JSON string → list
-        if isinstance(entities_raw, str):
-            try:
-                parsed = json.loads(entities_raw)
-            except Exception:
-                parse_errors += 1
-                continue
-        else:
-            parsed = entities_raw
-
-        if not isinstance(parsed, list):
-            continue
-
-        # Raw snapshot BEFORE mutation (so the debug dump shows the on-wire shape)
-        if include_raw_entities:
-            raw_per_alert.append({
-                "alert_id":   alert_id,
-                "alert_name": alert_nm,
-                "entities":   json.loads(json.dumps(parsed, default=str)),
-            })
-
-        # 1) Build $id → node map across the ENTIRE tree (any depth)
-        id_map = _build_id_map(parsed)
-        # 2) Resolve every $ref (at any depth) in place
-        _resolve_refs_in_place(parsed, id_map)
-        # 3) Collect every Type-tagged dict recursively — this surfaces
-        #    Process.ImageFile, Process.Account, Process.ParentProcess,
-        #    File.FileHashes[], Host.LastIpAddress, etc. as separate entities.
-        resolved = _collect_typed_entities(parsed)
-
-        # Extract per entity
-        for e in resolved:
-            if not isinstance(e, dict):
-                continue
-            etype = (e.get("Type") or "").lower()
-            if not etype:
-                continue
-
-            handler = _ENTITY_EXTRACTORS.get(etype)
-            if handler:
-                normalized_type, extractor = handler
-                fields = extractor(e)
-            else:
-                normalized_type = etype.replace("-", "_")
-                fields = _extract_generic_fields(e)
-                unknown_types[etype] = unknown_types.get(etype, 0) + 1
-
-            # Strip empty values
-            fields = {k: v for k, v in fields.items()
-                      if v not in (None, "", [], {})}
-
-            if not fields:
-                continue
-
-            key = _entity_dedup_key(normalized_type, fields)
-            if key in merged:
-                merged[key]["seen_in_alerts"].add(str(alert_id))
-                # Merge any new non-empty fields we didn't have yet
-                for fk, fv in fields.items():
-                    if fk not in merged[key]["fields"] and fv not in (None, "", [], {}):
-                        merged[key]["fields"][fk] = fv
-            else:
-                merged[key] = {
-                    "type":           normalized_type,
-                    "raw_type":       etype,
-                    "fields":         fields,
-                    "seen_in_alerts": {str(alert_id)} if alert_id else set(),
-                    "first_alert_time": alert_tm,
-                }
+    # Step 3: shared extraction pipeline (parse → resolve refs recursively →
+    #         collect typed entities → dedup across alerts). Single source of
+    #         truth — same code powers investigate_incident.
+    extraction = _extract_all_entities_from_alerts(
+        alerts, snapshot_raw=include_raw_entities
+    )
+    merged        = extraction["merged"]
+    parse_errors  = extraction["parse_errors"]
+    unknown_types = extraction["unknown_types"]
+    raw_per_alert = extraction["raw_snapshots"]
 
     # Step 4: shape output
     entities_flat: List[dict] = []
@@ -2819,14 +3029,20 @@ SecurityIncident
     alert_list = ",".join([f'"{a}"' for a in safe_alerts])
 
     # Keep REAL AlertName, don't overwrite with ProductName.
+    # Include SystemAlertId + TimeGenerated + dedup-by-id so the shared
+    # extraction helper can attribute entities to specific alerts and so
+    # duplicate ingestions of the same alert don't inflate counts.
     alerts_kql = f"""
 SecurityAlert
 | where SystemAlertId in ({alert_list})
+| summarize arg_max(TimeGenerated, *) by SystemAlertId
 | project
+    SystemAlertId,
     AlertName,
     ProductName,
     Component = ProductComponentName,
     AlertTime = StartTime,
+    TimeGenerated,
     Status,
     CompromisedEntity,
     Tactics,
@@ -2840,76 +3056,28 @@ SecurityAlert
 
     alerts = _la_first_table_dicts(alert_res["data"])
 
-    users: set = set()
-    ips: set = set()
-    hosts: set = set()
-    domains: set = set()
-    processes: set = set()
-    files: set = set()
+    # Run the shared extraction pipeline — same code that powers
+    # get_incident_entities. Handles nested $id/$ref resolution, recursive
+    # collection of typed sub-entities (Process.Account, Process.ImageFile,
+    # File.FileHashes[], Host.LastIpAddress, etc.), and cross-alert dedup.
+    extraction = _extract_all_entities_from_alerts(alerts, snapshot_raw=False)
+    entity_map = extraction["merged"]
 
-    id_map: Dict[str, dict] = {}
+    # Flatten the rich map into the legacy string-set shape (backwards
+    # compatible) + two new fields: `hashes` (scraped from File.FileHashes[]
+    # and standalone FileHash entities) and `local_accounts` (SYSTEM,
+    # LOCAL SERVICE, etc. — filtered out of `users` so they don't trip the
+    # identity checklist branch, but still visible).
+    flat = _flatten_entities_to_string_sets(entity_map)
 
-    for alert in alerts:
-        entities = alert.get("Entities")
-        if not entities:
-            continue
-        try:
-            ent_list = json.loads(entities) if isinstance(entities, str) else entities
-        except Exception:
-            continue
-        if not isinstance(ent_list, list):
-            continue
-
-        for e in ent_list:
-            if isinstance(e, dict) and "$id" in e:
-                id_map[str(e["$id"])] = e
-
-        for e in ent_list:
-            if not isinstance(e, dict):
-                continue
-
-            if "$ref" in e and "Type" not in e:
-                continue
-
-            etype = (e.get("Type") or "").lower()
-
-            if etype in ("host", "machine"):
-                name = e.get("HostName") or e.get("FQDN") or ""
-                if name:
-                    hosts.add(_normalize_entity_value(name).lower())
-                lip = (e.get("LastIpAddress") or {})
-                if isinstance(lip, dict) and lip.get("Address"):
-                    ips.add(lip["Address"])
-                eip = (e.get("LastExternalIpAddress") or {})
-                if isinstance(eip, dict) and eip.get("Address"):
-                    ips.add(eip["Address"])
-
-            elif etype == "account":
-                name = (e.get("AccountName") or e.get("UserPrincipalName")
-                        or e.get("Name") or "")
-                name = _normalize_entity_value(name)
-                if name and name.lower() not in ("system", ""):
-                    users.add(name.lower())
-
-            elif etype == "ip":
-                addr = e.get("Address") or ""
-                if addr:
-                    ips.add(addr)
-
-            elif etype == "dns":
-                d = e.get("DomainName") or ""
-                if d:
-                    domains.add(d.lower())
-
-            elif etype == "process":
-                cmd = e.get("CommandLine") or ""
-                if cmd:
-                    processes.add(cmd[:200])
-
-            elif etype == "file":
-                fname = e.get("Name") or ""
-                if fname:
-                    files.add(fname)
+    users     = set(flat["users"])
+    ips       = set(flat["ips"])
+    hosts     = set(flat["hosts"])
+    domains   = set(flat["domains"])
+    processes = set(flat["processes"])
+    files     = set(flat["files"])
+    hashes          = set(flat["hashes"])
+    local_accounts  = set(flat["local_accounts"])
 
     alert_times = [a.get("AlertTime") for a in alerts if a.get("AlertTime")]
     first_alert = min(alert_times) if alert_times else None
@@ -2980,12 +3148,21 @@ SecurityAlert
             "components":    sorted({a.get("Component") for a in alerts if a.get("Component")}),
         },
         "entities": {
-            "users":     sorted(users),
-            "ips":       sorted(ips),
-            "hosts":     sorted(hosts),
-            "domains":   sorted(domains),
-            "processes": sorted(processes),
-            "files":     sorted(files),
+            "users":          sorted(users),
+            "ips":            sorted(ips),
+            "hosts":          sorted(hosts),
+            "domains":        sorted(domains),
+            "processes":      sorted(processes),
+            "files":          sorted(files),
+            # New since shared-helper refactor:
+            #   hashes — sha256/sha1/md5 scraped from nested File.FileHashes[]
+            #            and standalone FileHash entities. run_investigation_checklist
+            #            feeds these into IOC enrichment automatically.
+            #   local_accounts — SYSTEM, LOCAL SERVICE, etc. extracted from
+            #            Process.Account but filtered out of `users` so they
+            #            don't trip the identity checklist branch.
+            "hashes":         sorted(hashes),
+            "local_accounts": sorted(local_accounts),
         },
         "timeline": {
             "first_alert": first_alert,
@@ -3603,10 +3780,14 @@ def run_investigation_checklist(
     for dom in (domains or [])[:IOC_MAX_DOMAINS_PER_INCIDENT]:
         _add_ioc(dom, "domain")
 
-    # Hashes — look in three places:
-    #   1. Incident entity list (entities.files, entities.processes)
-    #   2. Telemetry sample rows (SHA256, SHA1, MD5, InitiatingProcessSHA256, etc.)
-    #   3. Alert entity JSON (FileHash type entities)
+    # Hashes — look in FOUR places (priority order, highest first):
+    #   0. Incident alert JSON — entities.hashes (from shared extraction
+    #      helper; catches hashes nested in Process.ImageFile.FileHashes[]
+    #      and standalone FileHash entities that the old path missed)
+    #   1. Incident entity list — entities.files, entities.processes
+    #      (only catches hash-shaped file names)
+    #   2. Telemetry sample rows (SHA256, SHA1, MD5,
+    #      InitiatingProcessSHA256, etc.)
     hashes_found: List[Tuple[str, str]] = []
     _seen_hashes: set = set()
 
@@ -3621,7 +3802,12 @@ def run_investigation_checklist(
             _seen_hashes.add(v.lower())
             hashes_found.append((v, t))
 
-    # Source 1: entity list
+    # Source 0: hashes extracted by the shared entity helper (highest-fidelity —
+    # these are guaranteed-real hashes from File.FileHashes[] in alert JSON)
+    for v in (ents.get("hashes") or []):
+        _collect_hash(str(v))
+
+    # Source 1: entity list — only catches hash-shaped strings in file/process names
     for entity_list in [(ents.get("files") or []),
                         (ents.get("processes") or [])]:
         for v in entity_list:

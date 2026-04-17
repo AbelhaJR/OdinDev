@@ -2126,32 +2126,115 @@ by IncidentNumber
 #   mailbox, mailmessage, mailcluster, submissionmail, malware,
 #   securitygroup, cloud-logon-session, iotdevice, sentinelentities
 
-def _resolve_entity_refs(entities: list) -> list:
+def _build_id_map(root: Any) -> Dict[str, dict]:
     """
-    Sentinel entity JSON uses JSON.NET-style $id / $ref de-duplication.
-    Build an $id → entity map, then swap $ref placeholders for the real thing.
+    Walk the entire entity tree (any depth) and build a $id → node map.
+    Sentinel's $id tags can be nested arbitrarily deep — inside FileHashes[],
+    ImageFile, Account, ParentProcess, etc. — so we must recurse.
     """
-    if not isinstance(entities, list):
-        return []
-
     id_map: Dict[str, dict] = {}
-    for e in entities:
-        if isinstance(e, dict) and "$id" in e:
-            id_map[str(e["$id"])] = e
+    seen_py_ids: set = set()
 
-    resolved = []
-    for e in entities:
-        if not isinstance(e, dict):
-            continue
-        if "$ref" in e and "Type" not in e:
-            ref = str(e.get("$ref"))
-            target = id_map.get(ref)
-            if target and "Type" in target:
-                resolved.append(target)
-            # Silently drop unresolvable refs
-            continue
-        resolved.append(e)
-    return resolved
+    def walk(obj):
+        pyid = id(obj)
+        if pyid in seen_py_ids:
+            return
+        seen_py_ids.add(pyid)
+
+        if isinstance(obj, dict):
+            if "$id" in obj:
+                id_map[str(obj["$id"])] = obj
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(root)
+    return id_map
+
+
+def _resolve_refs_in_place(root: Any, id_map: Dict[str, dict]) -> None:
+    """
+    Walk the tree and replace any {"$ref": "X"} placeholder with the real
+    object from id_map. Mutates in place so subsequent tree walks see the
+    resolved structure.
+
+    Sentinel places $ref at ANY depth: Process.Account={"$ref":"8"},
+    Process.ParentProcess.ImageFile={"$ref":"5"}, File.FileHashes=[{"$ref":"12"}].
+    The old single-level resolver missed all of these.
+    """
+    seen_py_ids: set = set()
+
+    def walk(obj):
+        pyid = id(obj)
+        if pyid in seen_py_ids:
+            return
+        seen_py_ids.add(pyid)
+
+        if isinstance(obj, dict):
+            for k, v in list(obj.items()):
+                if isinstance(v, dict) and "$ref" in v and "Type" not in v:
+                    target = id_map.get(str(v["$ref"]))
+                    if target is not None:
+                        obj[k] = target  # replace with the real node
+                else:
+                    walk(v)
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                if isinstance(item, dict) and "$ref" in item and "Type" not in item:
+                    target = id_map.get(str(item["$ref"]))
+                    if target is not None:
+                        obj[i] = target
+                else:
+                    walk(item)
+
+    walk(root)
+
+
+def _collect_typed_entities(root: Any) -> List[dict]:
+    """
+    Walk the (already ref-resolved) tree and collect every dict that carries
+    a `Type` field — at any depth. This mirrors what the Sentinel incident
+    entity panel does: it surfaces Process.ImageFile, Process.Account,
+    Process.ParentProcess, File.FileHashes[], Host.LastIpAddress, etc. as
+    separate entity rows.
+
+    Dedup rules:
+      - If the same $id is seen twice (via $ref collapse), add it only once.
+      - If the same python object is seen twice (post-resolution), skip re-walk.
+      - Objects without $id that are semantic duplicates get collapsed later
+        by _entity_dedup_key() in the caller.
+    """
+    collected: List[dict] = []
+    seen_py_ids: set = set()
+    seen_dollar_ids: set = set()
+
+    def walk(obj):
+        pyid = id(obj)
+        if pyid in seen_py_ids:
+            return
+        seen_py_ids.add(pyid)
+
+        if isinstance(obj, dict):
+            if obj.get("Type"):
+                dollar_id = obj.get("$id")
+                if dollar_id is not None:
+                    did = str(dollar_id)
+                    if did not in seen_dollar_ids:
+                        seen_dollar_ids.add(did)
+                        collected.append(obj)
+                else:
+                    # No $id — include and let field-key dedup handle collisions
+                    collected.append(obj)
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(root)
+    return collected
 
 def _extract_host_fields(e: dict) -> dict:
     out = {
@@ -2391,7 +2474,13 @@ def _entity_dedup_key(normalized_type: str, fields: dict) -> str:
     if normalized_type == "ip":
         return f"ip::{_low(fields.get('address'))}"
     if normalized_type == "process":
-        return f"proc::{_low(fields.get('process_id'))}::{_low(fields.get('command_line'))[:200]}"
+        # Prefer PID alone — Sentinel frequently emits the same process twice:
+        # once with full command line, once as a sibling/parent stub (PID only).
+        # These should merge. Fall back to command line if PID is missing.
+        pid = _low(fields.get("process_id"))
+        if pid:
+            return f"proc::pid::{pid}"
+        return f"proc::cmd::{_low(fields.get('command_line'))[:200]}"
     if normalized_type == "file":
         # Try hash first, else path+name
         hashes = fields.get("hashes") or []
@@ -2540,15 +2629,22 @@ SecurityAlert
         if not isinstance(parsed, list):
             continue
 
-        # Resolve $ref pointers
-        resolved = _resolve_entity_refs(parsed)
-
+        # Raw snapshot BEFORE mutation (so the debug dump shows the on-wire shape)
         if include_raw_entities:
             raw_per_alert.append({
                 "alert_id":   alert_id,
                 "alert_name": alert_nm,
-                "entities":   parsed,
+                "entities":   json.loads(json.dumps(parsed, default=str)),
             })
+
+        # 1) Build $id → node map across the ENTIRE tree (any depth)
+        id_map = _build_id_map(parsed)
+        # 2) Resolve every $ref (at any depth) in place
+        _resolve_refs_in_place(parsed, id_map)
+        # 3) Collect every Type-tagged dict recursively — this surfaces
+        #    Process.ImageFile, Process.Account, Process.ParentProcess,
+        #    File.FileHashes[], Host.LastIpAddress, etc. as separate entities.
+        resolved = _collect_typed_entities(parsed)
 
         # Extract per entity
         for e in resolved:

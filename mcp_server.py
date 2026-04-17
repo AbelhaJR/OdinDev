@@ -943,8 +943,8 @@ def _build_confluence_html(doc: dict) -> str:
 #
 # Two-provider IOC lookup with in-memory cache and rate limiting.
 #
-#   VirusTotal   — supports IP, domain, URL, hash (sha256/sha1/md5)
-#   AbuseIPDB    — IP only
+#   VirusTotal   — domain, URL, hash (sha256/sha1/md5)   [IPs intentionally excluded]
+#   AbuseIPDB    — IP only                               [sole IP reputation source]
 #
 # Thread-safe cache keyed by (provider, normalized_ioc).
 # Simple token-bucket rate limit per provider to respect free tiers.
@@ -1258,17 +1258,26 @@ def _enrich_ioc(value: str, value_type: Optional[str] = None) -> dict:
     }
 
     # VirusTotal — runs for all supported types
-    vt_res = _enrich_virustotal(value, ioc_type)
-    if vt_res.get("ok"):
-        result["virustotal"] = vt_res["data"]
-    else:
+      # Provider routing:
+    #   IPs  → AbuseIPDB only (VT quota conservation — free tier is 4/min, 500/day)
+    #   rest → VirusTotal only (domains, URLs, hashes — AbuseIPDB can't handle these)
+    if ioc_type == "ip":
         result["virustotal"] = {
             "provider": "virustotal",
-            "status":   "error",
-            "error":    vt_res.get("error"),
-            "skipped":  vt_res.get("skipped", False),
+            "status":   "skipped",
+            "reason":   "IP routed to AbuseIPDB only (VT quota conservation)",
         }
-
+    else:
+        vt_res = _enrich_virustotal(value, ioc_type)
+        if vt_res.get("ok"):
+            result["virustotal"] = vt_res["data"]
+        else:
+            result["virustotal"] = {
+                "provider": "virustotal",
+                "status":   "error",
+                "error":    vt_res.get("error"),
+                "skipped":  vt_res.get("skipped", False),
+            }
     # AbuseIPDB — IP only
     if ioc_type == "ip":
         ab_res = _enrich_abuseipdb(value)
@@ -1277,7 +1286,7 @@ def _enrich_ioc(value: str, value_type: Optional[str] = None) -> dict:
         else:
             result["abuseipdb"] = {
                 "provider": "abuseipdb",
-                "status":   "error",
+                "status":   "error",f
                 "error":    ab_res.get("error"),
                 "skipped":  ab_res.get("skipped", False),
             }
@@ -2765,7 +2774,8 @@ def _scan_for_surfaced_hosts(buckets: Dict[str, dict], known_hosts: List[str]) -
 
 _register_tool_def("enrich_ioc",
     ("Look up an IOC (IP, domain, URL, SHA256/SHA1/MD5) in threat-intel feeds. "
-     "Queries VirusTotal for all supported types, and AbuseIPDB additionally for IPs. "
+     "Routing: IPs → AbuseIPDB only; domains/URLs/hashes → VirusTotal only. "
+     "(This split conserves VT free-tier quota since AbuseIPDB is the better IP source anyway.) "
      "Returns reputation verdict ('malicious' / 'suspicious' / 'clean' / 'unknown'), "
      "AV detection counts, community votes, geolocation, ASN, categories, and first-seen dates. "
      "Results are cached in-memory for 1 hour to respect free-tier API rate limits. "
@@ -3050,7 +3060,7 @@ def run_investigation_checklist(
         "errors":        sum(1 for v in ioc_enrichment.values()
                              if isinstance(v, dict) and v.get("status") == "error"),
         "providers_enabled": {
-            "virustotal": bool(VIRUSTOTAL_API_KEY),
+            "virustotal": bool(_VT_API_KEYS),
             "abuseipdb":  bool(ABUSEIPDB_API_KEY),
         },
     }

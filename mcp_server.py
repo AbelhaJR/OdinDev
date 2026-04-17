@@ -697,9 +697,9 @@ def _arm_get(url: str) -> dict:
     except Exception as e:
         return _fail("Failed to parse ARM JSON response", code="PARSE_ERROR", detail=str(e))
 
-def _arm_get_paged(base_url: str) -> dict:
+def _arm_get_paged(url: str) -> dict:
     all_items = []
-    url = base_url
+    url = url
 
     while url:
         res = _arm_get(url)
@@ -941,16 +941,21 @@ def _build_confluence_html(doc: dict) -> str:
 # IOC ENRICHMENT — VirusTotal + AbuseIPDB
 # ============================================================
 #
-# Two-provider IOC lookup with in-memory cache and rate limiting.
-#
+# Provider routing (VT free-tier quota conservation):
 #   VirusTotal   — domain, URL, hash (sha256/sha1/md5)   [IPs intentionally excluded]
 #   AbuseIPDB    — IP only                               [sole IP reputation source]
+#
+# Rationale: VirusTotal free tier caps at 4 req/min / 500 req/day. IPs are the
+# highest-volume IOC surfaced from Sentinel telemetry (SigninLogs, DeviceNetworkEvents,
+# CallerIpAddress, etc.), so sending them exclusively to AbuseIPDB — which allows
+# 1000 req/day and is arguably the better IP reputation source anyway — preserves
+# VT budget for domains, URLs, and file hashes that AbuseIPDB cannot score.
 #
 # Thread-safe cache keyed by (provider, normalized_ioc).
 # Simple token-bucket rate limit per provider to respect free tiers.
 #
 # Required env vars:
-#   VIRUSTOTAL_API_KEY
+#   VIRUSTOTAL_API_KEY (or VIRUSTOTAL_API_KEYS / VIRUSTOTAL_API_KEY_1..20)
 #   ABUSEIPDB_API_KEY
 #
 # Optional env vars (see CONFIGURATION):
@@ -1044,7 +1049,8 @@ def _vt_parse_analysis(attributes: dict) -> dict:
 
 def _enrich_virustotal(value: str, ioc_type: str) -> dict:
     """
-    Query VirusTotal for IP, domain, URL, or hash — with automatic key rotation.
+    Query VirusTotal for domain, URL, or hash — with automatic key rotation.
+    IPs are NOT sent to VirusTotal (routed to AbuseIPDB instead — see _enrich_ioc).
     On 429, marks the current key as cooling down and retries with the next one.
     """
     if not _VT_API_KEYS:
@@ -1057,9 +1063,8 @@ def _enrich_virustotal(value: str, ioc_type: str) -> dict:
         return {"ok": True, "data": cached, "cached": True}
 
     # Map IOC type → VT URL path
-    if ioc_type == "ip":
-        path = f"ip_addresses/{value}"
-    elif ioc_type == "domain":
+    # Note: "ip" is intentionally absent — IPs go to AbuseIPDB only.
+    if ioc_type == "domain":
         path = f"domains/{value}"
     elif ioc_type == "url":
         import base64
@@ -1152,7 +1157,7 @@ def _enrich_virustotal(value: str, ioc_type: str) -> dict:
             "verdict": ("malicious" if malicious >= VT_MALICIOUS_VOTES_THRESHOLD
                         else "suspicious" if malicious > 0 or analysis["suspicious_engines"] > 0
                         else "clean"),
-            "gui_link": f"https://www.virustotal.com/gui/{'ip-address' if ioc_type=='ip' else ioc_type}/{value}",
+            "gui_link": f"https://www.virustotal.com/gui/{ioc_type}/{value}",
         }
         _ioc_cache_set(cache_key, result)
         return {"ok": True, "data": result}
@@ -1162,7 +1167,7 @@ def _enrich_virustotal(value: str, ioc_type: str) -> dict:
 # ── AbuseIPDB ─────────────────────────────────────────────────────────
 
 def _enrich_abuseipdb(ip: str) -> dict:
-    """Query AbuseIPDB for an IP address."""
+    """Query AbuseIPDB for an IP address. Sole provider for IP IOCs."""
     if not ABUSEIPDB_API_KEY:
         return {"ok": False, "error": "ABUSEIPDB_API_KEY not configured",
                 "skipped": True}
@@ -1228,13 +1233,18 @@ def _enrich_abuseipdb(ip: str) -> dict:
 
 def _enrich_ioc(value: str, value_type: Optional[str] = None) -> dict:
     """
-    Run all applicable IOC providers for a given value.
+    Run the appropriate IOC provider(s) for a given value.
+
+    Provider routing:
+      • IPs        → AbuseIPDB only (VT quota conservation)
+      • Everything → VirusTotal only (domains/URLs/hashes)
+
     Returns:
       {
         "ioc": "...",
         "ioc_type": "ip" | "domain" | "sha256" | ...,
         "virustotal": {...} | null,
-        "abuseipdb":  {...} | null,           (IP only)
+        "abuseipdb":  {...} | null,
         "verdict":    "malicious" | "suspicious" | "clean" | "unknown",
         "escalate":   true | false
       }
@@ -1257,17 +1267,29 @@ def _enrich_ioc(value: str, value_type: Optional[str] = None) -> dict:
         "escalate":   False,
     }
 
-    # VirusTotal — runs for all supported types
-      # Provider routing:
-    #   IPs  → AbuseIPDB only (VT quota conservation — free tier is 4/min, 500/day)
-    #   rest → VirusTotal only (domains, URLs, hashes — AbuseIPDB can't handle these)
+    # ── Provider routing ────────────────────────────────────────────
+    # IPs go to AbuseIPDB ONLY. Everything else goes to VirusTotal ONLY.
+    # This conserves VT's scarce free-tier quota (4/min, 500/day) by
+    # offloading the high-volume IP traffic to AbuseIPDB (1000/day).
     if ioc_type == "ip":
+        # Mark VT as skipped-by-design so the client can see it wasn't an error.
         result["virustotal"] = {
             "provider": "virustotal",
             "status":   "skipped",
             "reason":   "IP routed to AbuseIPDB only (VT quota conservation)",
         }
+        ab_res = _enrich_abuseipdb(value)
+        if ab_res.get("ok"):
+            result["abuseipdb"] = ab_res["data"]
+        else:
+            result["abuseipdb"] = {
+                "provider": "abuseipdb",
+                "status":   "error",
+                "error":    ab_res.get("error"),
+                "skipped":  ab_res.get("skipped", False),
+            }
     else:
+        # Non-IP IOCs: VirusTotal only (AbuseIPDB can't score domains/URLs/hashes).
         vt_res = _enrich_virustotal(value, ioc_type)
         if vt_res.get("ok"):
             result["virustotal"] = vt_res["data"]
@@ -1278,26 +1300,14 @@ def _enrich_ioc(value: str, value_type: Optional[str] = None) -> dict:
                 "error":    vt_res.get("error"),
                 "skipped":  vt_res.get("skipped", False),
             }
-    # AbuseIPDB — IP only
-    if ioc_type == "ip":
-        ab_res = _enrich_abuseipdb(value)
-        if ab_res.get("ok"):
-            result["abuseipdb"] = ab_res["data"]
-        else:
-            result["abuseipdb"] = {
-                "provider": "abuseipdb",
-                "status":   "error",f
-                "error":    ab_res.get("error"),
-                "skipped":  ab_res.get("skipped", False),
-            }
 
     # ── Aggregate verdict ──────────────────────────────────────────
     vt = result["virustotal"] if isinstance(result["virustotal"], dict) else {}
     ab = result["abuseipdb"]  if isinstance(result["abuseipdb"], dict) else {}
 
     vt_malicious  = int(vt.get("malicious_engines") or 0)
-    ab_score      = int(ab.get("abuse_confidence_score") or 0)
     vt_suspicious = int(vt.get("suspicious_engines") or 0)
+    ab_score      = int(ab.get("abuse_confidence_score") or 0)
 
     if (vt_malicious >= VT_MALICIOUS_VOTES_THRESHOLD
             or ab_score >= ABUSEIPDB_SCORE_THRESHOLD):
@@ -1318,8 +1328,8 @@ def _enrich_iocs_parallel(iocs: List[Tuple[str, str]],
     Enrich a list of (value, ioc_type) tuples in parallel.
     Returns dict keyed by ioc value.
     Rate limits are still enforced inside each enrichment call, so parallel
-    execution doesn't bypass VT's 4/min cap — it just reduces idle time on
-    cache hits and the faster AbuseIPDB lane.
+    execution doesn't bypass provider caps — it just reduces idle time on
+    cache hits.
     """
     results: Dict[str, dict] = {}
     if not iocs:
@@ -2097,7 +2107,536 @@ by IncidentNumber
     })
 
 # ============================================================
-# investigate_incident  ───  FIX 1 APPLIED
+# get_incident_entities
+# ============================================================
+# Dedicated, thorough entity extractor. More complete than what
+# get_incident_report / investigate_incident surface:
+#   • Parses the FULL alert Entity JSON (not just a subset of fields)
+#   • Resolves $ref pointers using the $id map inside each alert
+#   • Extracts per-type useful fields (hosts → FQDN + IPs + OS + AzureID,
+#     accounts → UPN + SID + NTDomain + AadUserId, files → hashes + path,
+#     processes → commandline + PID + parent, etc.)
+#   • Deduplicates entities across alerts by a normalized key
+#   • Returns both a grouped-by-type view and a flat list
+#   • Per-entity trace: which alert(s) referenced each entity
+
+# Entity types seen in Sentinel SecurityAlert.Entities:
+#   host/machine, account, ip, process, file, filehash, url, dns,
+#   registrykey, registryvalue, cloudapplication, azureresource,
+#   mailbox, mailmessage, mailcluster, submissionmail, malware,
+#   securitygroup, cloud-logon-session, iotdevice, sentinelentities
+
+def _resolve_entity_refs(entities: list) -> list:
+    """
+    Sentinel entity JSON uses JSON.NET-style $id / $ref de-duplication.
+    Build an $id → entity map, then swap $ref placeholders for the real thing.
+    """
+    if not isinstance(entities, list):
+        return []
+
+    id_map: Dict[str, dict] = {}
+    for e in entities:
+        if isinstance(e, dict) and "$id" in e:
+            id_map[str(e["$id"])] = e
+
+    resolved = []
+    for e in entities:
+        if not isinstance(e, dict):
+            continue
+        if "$ref" in e and "Type" not in e:
+            ref = str(e.get("$ref"))
+            target = id_map.get(ref)
+            if target and "Type" in target:
+                resolved.append(target)
+            # Silently drop unresolvable refs
+            continue
+        resolved.append(e)
+    return resolved
+
+def _extract_host_fields(e: dict) -> dict:
+    out = {
+        "hostname":        e.get("HostName") or e.get("Name"),
+        "fqdn":            e.get("FQDN"),
+        "nt_domain":       e.get("NTDomain"),
+        "dns_domain":      e.get("DnsDomain"),
+        "os_family":       e.get("OSFamily"),
+        "os_version":      e.get("OSVersion"),
+        "azure_id":        e.get("AzureID"),
+        "mdatp_device_id": e.get("MdatpDeviceId"),
+        "oms_agent_id":    e.get("OMSAgentID"),
+        "is_domain_joined":e.get("IsDomainJoined"),
+    }
+    lip = e.get("LastIpAddress") or {}
+    if isinstance(lip, dict) and lip.get("Address"):
+        out["last_ip"] = lip["Address"]
+    eip = e.get("LastExternalIpAddress") or {}
+    if isinstance(eip, dict) and eip.get("Address"):
+        out["last_external_ip"] = eip["Address"]
+    return out
+
+def _extract_account_fields(e: dict) -> dict:
+    # Construct a canonical account name if we only got parts
+    name = e.get("Name") or e.get("AccountName")
+    nt_domain = e.get("NTDomain")
+    upn_suffix = e.get("UPNSuffix")
+    upn = e.get("UserPrincipalName")
+    if not upn and name and upn_suffix:
+        upn = f"{name}@{upn_suffix}"
+
+    display_name = name
+    if nt_domain and name:
+        display_name = f"{nt_domain}\\{name}"
+
+    return {
+        "name":            name,
+        "display_name":    display_name,
+        "upn":             upn,
+        "upn_suffix":      upn_suffix,
+        "nt_domain":       nt_domain,
+        "sid":             e.get("Sid"),
+        "aad_user_id":     e.get("AadUserId"),
+        "aad_tenant_id":   e.get("AadTenantId"),
+        "is_domain_joined":e.get("IsDomainJoined"),
+        "object_guid":     e.get("ObjectGuid"),
+        "puid":            e.get("PUID"),
+    }
+
+def _extract_ip_fields(e: dict) -> dict:
+    out = {"address": e.get("Address")}
+    loc = e.get("Location") or {}
+    if isinstance(loc, dict):
+        out["country"] = loc.get("CountryName") or loc.get("Country")
+        out["city"]    = loc.get("City")
+        out["state"]   = loc.get("State")
+        out["asn"]     = loc.get("Asn")
+        out["isp"]     = loc.get("CarrierName")
+    return out
+
+def _extract_process_fields(e: dict) -> dict:
+    out = {
+        "command_line":        e.get("CommandLine"),
+        "process_id":          e.get("ProcessId"),
+        "elevation_token":     e.get("ElevationToken"),
+        "creation_time_utc":   e.get("CreationTimeUtc"),
+    }
+    img = e.get("ImageFile") or {}
+    if isinstance(img, dict):
+        out["image_name"] = img.get("Name")
+        out["image_dir"]  = img.get("Directory")
+        # File hashes attached to the image
+        fhs = img.get("FileHashes") or []
+        if isinstance(fhs, list):
+            out["image_hashes"] = [
+                {"algorithm": fh.get("Algorithm"), "value": fh.get("Value")}
+                for fh in fhs if isinstance(fh, dict)
+            ]
+    parent = e.get("ParentProcess") or {}
+    if isinstance(parent, dict):
+        out["parent_command_line"] = parent.get("CommandLine")
+        out["parent_process_id"]   = parent.get("ProcessId")
+    return out
+
+def _extract_file_fields(e: dict) -> dict:
+    out = {
+        "name":      e.get("Name"),
+        "directory": e.get("Directory"),
+    }
+    fhs = e.get("FileHashes") or []
+    if isinstance(fhs, list):
+        out["hashes"] = [
+            {"algorithm": fh.get("Algorithm"), "value": fh.get("Value")}
+            for fh in fhs if isinstance(fh, dict)
+        ]
+    return out
+
+def _extract_filehash_fields(e: dict) -> dict:
+    return {
+        "algorithm": e.get("Algorithm"),
+        "value":     e.get("Value") or e.get("HashValue"),
+    }
+
+def _extract_url_fields(e: dict) -> dict:
+    return {"url": e.get("Url")}
+
+def _extract_dns_fields(e: dict) -> dict:
+    out = {"domain_name": e.get("DomainName")}
+    ips = e.get("IpAddresses")
+    if isinstance(ips, list):
+        out["ip_addresses"] = [
+            ip.get("Address") if isinstance(ip, dict) else ip
+            for ip in ips
+        ]
+    dns_server = e.get("DnsServerIp") or {}
+    if isinstance(dns_server, dict) and dns_server.get("Address"):
+        out["dns_server_ip"] = dns_server["Address"]
+    return out
+
+def _extract_registrykey_fields(e: dict) -> dict:
+    return {
+        "hive": e.get("Hive"),
+        "key":  e.get("Key"),
+    }
+
+def _extract_registryvalue_fields(e: dict) -> dict:
+    out = {
+        "name":       e.get("Name"),
+        "value":      e.get("Value"),
+        "value_type": e.get("ValueType"),
+    }
+    key = e.get("Key") or {}
+    if isinstance(key, dict):
+        out["key_hive"] = key.get("Hive")
+        out["key_path"] = key.get("Key")
+    return out
+
+def _extract_cloudapp_fields(e: dict) -> dict:
+    return {
+        "name":          e.get("Name"),
+        "app_id":        e.get("AppId"),
+        "instance_name": e.get("InstanceName"),
+    }
+
+def _extract_azureresource_fields(e: dict) -> dict:
+    return {
+        "resource_id":   e.get("ResourceId"),
+        "subscription":  e.get("SubscriptionId"),
+    }
+
+def _extract_mailbox_fields(e: dict) -> dict:
+    return {
+        "primary_address": e.get("MailboxPrimaryAddress"),
+        "display_name":    e.get("DisplayName"),
+        "upn":             e.get("Upn"),
+        "risk_level":      e.get("RiskLevel"),
+    }
+
+def _extract_mailmessage_fields(e: dict) -> dict:
+    return {
+        "network_message_id":  e.get("NetworkMessageId"),
+        "internet_message_id": e.get("InternetMessageId"),
+        "recipient":           e.get("Recipient"),
+        "sender":              e.get("Sender") or e.get("SenderAddress"),
+        "sender_display_name": e.get("SenderDisplayName"),
+        "subject":             e.get("Subject"),
+        "delivery_location":   e.get("DeliveryLocation"),
+        "delivery_action":     e.get("DeliveryAction"),
+        "p1_sender":           e.get("P1Sender"),
+        "p2_sender":           e.get("P2Sender"),
+        "threats":             e.get("Threats"),
+        "urls":                e.get("Urls"),
+    }
+
+def _extract_malware_fields(e: dict) -> dict:
+    return {
+        "name":     e.get("Name"),
+        "category": e.get("Category"),
+    }
+
+def _extract_securitygroup_fields(e: dict) -> dict:
+    return {
+        "distinguished_name": e.get("DistinguishedName"),
+        "sid":                e.get("Sid"),
+        "object_guid":        e.get("ObjectGuid"),
+    }
+
+def _extract_generic_fields(e: dict) -> dict:
+    """Fallback for types we don't specifically handle — keep everything useful."""
+    return {
+        k: v for k, v in e.items()
+        if not k.startswith("$") and k != "Type"
+        and v not in (None, "", [], {})
+    }
+
+# Type → (normalized_type, extractor)
+_ENTITY_EXTRACTORS = {
+    "host":                ("host",           _extract_host_fields),
+    "machine":             ("host",           _extract_host_fields),
+    "account":             ("account",        _extract_account_fields),
+    "ip":                  ("ip",             _extract_ip_fields),
+    "process":             ("process",        _extract_process_fields),
+    "file":                ("file",           _extract_file_fields),
+    "filehash":            ("filehash",       _extract_filehash_fields),
+    "url":                 ("url",            _extract_url_fields),
+    "dns":                 ("dns",            _extract_dns_fields),
+    "registrykey":         ("registry_key",   _extract_registrykey_fields),
+    "registry-key":        ("registry_key",   _extract_registrykey_fields),
+    "registryvalue":       ("registry_value", _extract_registryvalue_fields),
+    "registry-value":      ("registry_value", _extract_registryvalue_fields),
+    "cloudapplication":    ("cloud_app",      _extract_cloudapp_fields),
+    "cloud-application":   ("cloud_app",      _extract_cloudapp_fields),
+    "azureresource":       ("azure_resource", _extract_azureresource_fields),
+    "azure-resource":      ("azure_resource", _extract_azureresource_fields),
+    "mailbox":             ("mailbox",        _extract_mailbox_fields),
+    "mailmessage":         ("mail_message",   _extract_mailmessage_fields),
+    "mail-message":        ("mail_message",   _extract_mailmessage_fields),
+    "malware":             ("malware",        _extract_malware_fields),
+    "securitygroup":       ("security_group", _extract_securitygroup_fields),
+    "security-group":      ("security_group", _extract_securitygroup_fields),
+}
+
+def _entity_dedup_key(normalized_type: str, fields: dict) -> str:
+    """
+    Build a stable dedup key per entity. Uses the most identifying field
+    for each type so the same entity seen across multiple alerts collapses.
+    """
+    def _low(v):
+        return str(v).strip().lower() if v else ""
+
+    if normalized_type == "host":
+        # Prefer FQDN, then hostname
+        return f"host::{_low(fields.get('fqdn') or fields.get('hostname'))}"
+    if normalized_type == "account":
+        # UPN first, else domain\name, else SID
+        return f"account::{_low(fields.get('upn') or fields.get('display_name') or fields.get('sid') or fields.get('aad_user_id'))}"
+    if normalized_type == "ip":
+        return f"ip::{_low(fields.get('address'))}"
+    if normalized_type == "process":
+        return f"proc::{_low(fields.get('process_id'))}::{_low(fields.get('command_line'))[:200]}"
+    if normalized_type == "file":
+        # Try hash first, else path+name
+        hashes = fields.get("hashes") or []
+        if hashes and isinstance(hashes, list) and hashes[0].get("value"):
+            return f"file::hash::{_low(hashes[0].get('value'))}"
+        return f"file::{_low(fields.get('directory'))}::{_low(fields.get('name'))}"
+    if normalized_type == "filehash":
+        return f"hash::{_low(fields.get('value'))}"
+    if normalized_type == "url":
+        return f"url::{_low(fields.get('url'))}"
+    if normalized_type == "dns":
+        return f"dns::{_low(fields.get('domain_name'))}"
+    if normalized_type == "registry_key":
+        return f"rk::{_low(fields.get('hive'))}::{_low(fields.get('key'))}"
+    if normalized_type == "registry_value":
+        return f"rv::{_low(fields.get('key_hive'))}::{_low(fields.get('key_path'))}::{_low(fields.get('name'))}"
+    if normalized_type == "cloud_app":
+        return f"app::{_low(fields.get('app_id') or fields.get('name'))}"
+    if normalized_type == "azure_resource":
+        return f"azres::{_low(fields.get('resource_id'))}"
+    if normalized_type == "mailbox":
+        return f"mbox::{_low(fields.get('primary_address') or fields.get('upn'))}"
+    if normalized_type == "mail_message":
+        return f"msg::{_low(fields.get('network_message_id') or fields.get('internet_message_id'))}"
+    if normalized_type == "malware":
+        return f"mw::{_low(fields.get('name'))}::{_low(fields.get('category'))}"
+    if normalized_type == "security_group":
+        return f"sg::{_low(fields.get('sid') or fields.get('distinguished_name'))}"
+    # Fallback: hash-ish of all values
+    return f"{normalized_type}::{_low(json.dumps(fields, sort_keys=True, default=str))[:300]}"
+
+_register_tool_def("get_incident_entities",
+    ("Returns the COMPLETE entity inventory extracted from every alert linked to a "
+     "Sentinel incident. More thorough than get_incident_report / investigate_incident: "
+     "parses the full Entity JSON, resolves $ref references, extracts every useful field "
+     "per entity type (hosts get FQDN + IPs + OS + AzureID; accounts get UPN + SID + "
+     "NTDomain + AadUserId; files get hashes + path; processes get command line + PID + "
+     "parent; mail messages get sender + recipient + subject; etc.), and deduplicates "
+     "entities seen across multiple alerts. Each entity carries a 'seen_in_alerts' list "
+     "so you can trace which alert(s) surfaced it. Use this when you want the full entity "
+     "picture — for IOC enrichment, scoping, or feeding downstream tools."),
+    {"incident_id": "Sentinel incident number or IncidentName",
+     "timespan":    "ISO8601 duration, default P7D",
+     "include_raw_entities": "optional bool, default false — include the raw Entity JSON per alert for debugging"})
+
+@mcp.tool
+def get_incident_entities(incident_id: str, timespan: str = "P7D",
+                          include_raw_entities: bool = False) -> dict:
+    if not incident_id:
+        return _fail("incident_id is required", code="VALIDATION_ERROR")
+
+    try:
+        hours = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
+
+    if hours <= 0 or hours > MAX_HOURS_INCIDENT:
+        return _fail(f"Timespan exceeds allowed window ({MAX_HOURS_INCIDENT}h max)",
+                     code="VALIDATION_ERROR", detail=f"got {hours}h")
+
+    safe_id = escape_kql_string(str(incident_id))
+
+    # Step 1: resolve incident → alert ids
+    inc_kql = f"""
+SecurityIncident
+| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| project IncidentNumber, Title, Severity, Status, AlertIds
+""".strip()
+
+    inc_res = la_query(inc_kql, timespan)
+    if not inc_res.get("ok"):
+        return inc_res
+
+    inc_rows = _la_first_table_dicts(inc_res["data"])
+    if not inc_rows:
+        return _fail("Incident not found", code="NOT_FOUND")
+
+    incident = inc_rows[0]
+    alert_ids = incident.get("AlertIds") or []
+
+    if isinstance(alert_ids, str):
+        try:
+            alert_ids = json.loads(alert_ids)
+        except Exception:
+            alert_ids = []
+
+    if not alert_ids:
+        return _ok({
+            "incident": {
+                "number":   incident.get("IncidentNumber"),
+                "title":    incident.get("Title"),
+                "severity": incident.get("Severity"),
+                "status":   incident.get("Status"),
+            },
+            "alert_count":    0,
+            "entity_count":   0,
+            "entities_by_type": {},
+            "entities_flat":  [],
+            "assessment":     "Incident has no linked alerts",
+        })
+
+    # Step 2: fetch alert entities
+    safe_alerts = [escape_kql_string(str(a)) for a in alert_ids if a]
+    alert_list = ",".join([f'"{a}"' for a in safe_alerts])
+
+    alerts_kql = f"""
+SecurityAlert
+| where SystemAlertId in ({alert_list})
+| summarize arg_max(TimeGenerated, *) by SystemAlertId
+| project SystemAlertId, AlertName, AlertSeverity, TimeGenerated, Entities
+""".strip()
+
+    alerts_res = la_query(alerts_kql, timespan)
+    if not alerts_res.get("ok"):
+        return alerts_res
+
+    alerts = _la_first_table_dicts(alerts_res["data"])
+
+    # Step 3: parse + resolve + extract
+    # Key: dedup_key → {type, fields, seen_in_alerts, first_seen_time}
+    merged: Dict[str, Dict[str, Any]] = {}
+    raw_per_alert: List[Dict[str, Any]] = []
+    unknown_types: Dict[str, int] = {}
+    parse_errors = 0
+
+    for alert in alerts:
+        alert_id  = alert.get("SystemAlertId")
+        alert_nm  = alert.get("AlertName")
+        alert_tm  = alert.get("TimeGenerated")
+        entities_raw = alert.get("Entities")
+
+        if not entities_raw:
+            continue
+
+        # Parse JSON string → list
+        if isinstance(entities_raw, str):
+            try:
+                parsed = json.loads(entities_raw)
+            except Exception:
+                parse_errors += 1
+                continue
+        else:
+            parsed = entities_raw
+
+        if not isinstance(parsed, list):
+            continue
+
+        # Resolve $ref pointers
+        resolved = _resolve_entity_refs(parsed)
+
+        if include_raw_entities:
+            raw_per_alert.append({
+                "alert_id":   alert_id,
+                "alert_name": alert_nm,
+                "entities":   parsed,
+            })
+
+        # Extract per entity
+        for e in resolved:
+            if not isinstance(e, dict):
+                continue
+            etype = (e.get("Type") or "").lower()
+            if not etype:
+                continue
+
+            handler = _ENTITY_EXTRACTORS.get(etype)
+            if handler:
+                normalized_type, extractor = handler
+                fields = extractor(e)
+            else:
+                normalized_type = etype.replace("-", "_")
+                fields = _extract_generic_fields(e)
+                unknown_types[etype] = unknown_types.get(etype, 0) + 1
+
+            # Strip empty values
+            fields = {k: v for k, v in fields.items()
+                      if v not in (None, "", [], {})}
+
+            if not fields:
+                continue
+
+            key = _entity_dedup_key(normalized_type, fields)
+            if key in merged:
+                merged[key]["seen_in_alerts"].add(str(alert_id))
+                # Merge any new non-empty fields we didn't have yet
+                for fk, fv in fields.items():
+                    if fk not in merged[key]["fields"] and fv not in (None, "", [], {}):
+                        merged[key]["fields"][fk] = fv
+            else:
+                merged[key] = {
+                    "type":           normalized_type,
+                    "raw_type":       etype,
+                    "fields":         fields,
+                    "seen_in_alerts": {str(alert_id)} if alert_id else set(),
+                    "first_alert_time": alert_tm,
+                }
+
+    # Step 4: shape output
+    entities_flat: List[dict] = []
+    entities_by_type: Dict[str, List[dict]] = {}
+
+    for entry in merged.values():
+        obj = {
+            "type":             entry["type"],
+            "raw_type":         entry["raw_type"],
+            "fields":           entry["fields"],
+            "seen_in_alerts":   sorted(entry["seen_in_alerts"]),
+            "alert_count":      len(entry["seen_in_alerts"]),
+            "first_alert_time": entry["first_alert_time"],
+        }
+        entities_flat.append(obj)
+        entities_by_type.setdefault(entry["type"], []).append(obj)
+
+    # Deterministic ordering: most-seen entities first, then by type
+    entities_flat.sort(key=lambda x: (-x["alert_count"], x["type"]))
+    for t in entities_by_type:
+        entities_by_type[t].sort(key=lambda x: -x["alert_count"])
+
+    # Summary counts per type
+    type_counts = {t: len(v) for t, v in entities_by_type.items()}
+
+    out = {
+        "incident": {
+            "number":   incident.get("IncidentNumber"),
+            "title":    incident.get("Title"),
+            "severity": incident.get("Severity"),
+            "status":   incident.get("Status"),
+        },
+        "alert_count":       len(alerts),
+        "entity_count":      len(entities_flat),
+        "type_counts":       type_counts,
+        "entities_by_type":  entities_by_type,
+        "entities_flat":     entities_flat,
+        "parse_errors":      parse_errors,
+        "unknown_types":     unknown_types,  # so we learn about types we should add
+    }
+
+    if include_raw_entities:
+        out["raw_entities_per_alert"] = raw_per_alert
+
+    return _ok(out)
+
+# ============================================================
+# investigate_incident
 # ============================================================
 # CHANGES vs previous version:
 #   • Incident query now projects Title (needed by run_investigation_checklist
@@ -2134,7 +2673,7 @@ def investigate_incident(incident_id: str, timespan: str = "P7D") -> dict:
 
     safe_id = escape_kql_string(str(incident_id))
 
-    # FIX 1a: Project Title so we can use it for branch detection.
+    # Project Title so we can use it for branch detection.
     incident_kql = f"""
 SecurityIncident
 | where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
@@ -2183,9 +2722,7 @@ SecurityIncident
     safe_alerts = [escape_kql_string(str(a)) for a in alert_ids if a]
     alert_list = ",".join([f'"{a}"' for a in safe_alerts])
 
-    # FIX 1b: Keep REAL AlertName, don't overwrite with ProductName.
-    # (Previous code did `AlertName = ProductName` which broke branch
-    #  auto-detection because every alert ended up named "Azure Sentinel".)
+    # Keep REAL AlertName, don't overwrite with ProductName.
     alerts_kql = f"""
 SecurityAlert
 | where SystemAlertId in ({alert_list})
@@ -2282,7 +2819,7 @@ SecurityAlert
     first_alert = min(alert_times) if alert_times else None
     last_alert = max(alert_times) if alert_times else None
 
-    # FIX 3: Flatten Tactics/Techniques — they come back from Sentinel as
+    # Flatten Tactics/Techniques — they come back from Sentinel as
     # JSON-stringified lists. This undoes `["[\"T1110\"]"]` → `["T1110"]`.
     tactics = _flatten_mitre_field([a.get("Tactics") for a in alerts])
     techniques = _flatten_mitre_field([a.get("Techniques") for a in alerts])
@@ -2569,8 +3106,7 @@ def _append_site_cl_tasks(tasks: List[dict], safe_host: str) -> List[dict]:
     return tasks
 
 # ─────────────────────────────────────────────────────────────
-# FIX 2: _auto_detect_checklist — tactic-first shortcut + reordered
-# keyword matching + removed bare "azure" (was matching "Azure Sentinel")
+# _auto_detect_checklist — tactic-first shortcut + reordered keyword matching
 # ─────────────────────────────────────────────────────────────
 def _auto_detect_checklist(alert_names: List[str], tactics: List[str],
                             incident_title: str = "") -> str:
@@ -2585,9 +3121,7 @@ def _auto_detect_checklist(alert_names: List[str], tactics: List[str],
       5. behavioral / execution
       6. default
 
-    The incident_title is the PRIMARY source of keywords. The previous
-    code fed in ProductName ("Azure Sentinel") which always matched
-    "azure" → cloud branch. Fixed here.
+    The incident_title is the PRIMARY source of keywords.
     """
     combined = " ".join(
         ([incident_title] if incident_title else [])
@@ -2598,8 +3132,6 @@ def _auto_detect_checklist(alert_names: List[str], tactics: List[str],
     tactics_lower = [str(t).lower() for t in (tactics or [])]
 
     # ── 1. MITRE tactic shortcut ──────────────────────────────────────
-    # CredentialAccess / InitialAccess strongly signal identity, UNLESS
-    # there's also an endpoint-centric tactic (execution, lateral, etc).
     if any("credentialaccess" in t or "initialaccess" in t for t in tactics_lower):
         if not any(t in tactics_lower for t in
                    ["execution", "lateralmovement", "defenseevasion",
@@ -2774,8 +3306,9 @@ def _scan_for_surfaced_hosts(buckets: Dict[str, dict], known_hosts: List[str]) -
 
 _register_tool_def("enrich_ioc",
     ("Look up an IOC (IP, domain, URL, SHA256/SHA1/MD5) in threat-intel feeds. "
-     "Routing: IPs → AbuseIPDB only; domains/URLs/hashes → VirusTotal only. "
-     "(This split conserves VT free-tier quota since AbuseIPDB is the better IP source anyway.) "
+     "Provider routing: IPs → AbuseIPDB only; domains / URLs / hashes → VirusTotal only. "
+     "(This split conserves VT free-tier quota since AbuseIPDB is the better IP reputation "
+     "source anyway and handles far more daily calls.) "
      "Returns reputation verdict ('malicious' / 'suspicious' / 'clean' / 'unknown'), "
      "AV detection counts, community votes, geolocation, ASN, categories, and first-seen dates. "
      "Results are cached in-memory for 1 hour to respect free-tier API rate limits. "
@@ -2795,15 +3328,15 @@ def enrich_ioc(value: str, value_type: Optional[str] = None) -> dict:
     return _ok(res["data"])
 
 # ============================================================
-# run_investigation_checklist  ───  uses all three fixes
+# run_investigation_checklist
 # ============================================================
 
 _register_tool_def("run_investigation_checklist",
     ("Executes a parallel server-side batch of telemetry queries for an incident and returns "
      "compact bucket summaries. Auto-detects checklist branch from incident title + alert names "
      "+ MITRE tactics (title is the primary source, alert names and tactics are supplementary). "
-     "Also auto-enriches primary IOCs (IPs, domains, hashes) via VirusTotal + AbuseIPDB and "
-     "escalates the incident if any IOC scores above threshold."),
+     "Also auto-enriches primary IOCs: IPs go to AbuseIPDB; domains and hashes go to VirusTotal. "
+     "Escalates the incident if any IOC scores above threshold."),
     {"incident_id":  "Sentinel incident number",
      "checklist":    "auto | execution | identity | lateral_movement | network | malware | cloud | behavioral | default",
      "timespan":     "ISO8601 duration, default P7D"})
@@ -2838,8 +3371,7 @@ def run_investigation_checklist(
     tactics     = list((inc_data.get("mitre") or {}).get("tactics") or [])
     techniques  = list((inc_data.get("mitre") or {}).get("techniques") or [])
 
-    # FIX 2 USAGE: Pass incident title to the auto-detect so it can use the
-    # real rule name ("Defender | Euronext | Brute force with result login")
+    # Pass incident title to the auto-detect so it can use the real rule name
     # rather than relying on ProductName which is always "Azure Sentinel".
     incident_title = str(incident.get("title") or "")
 
@@ -2927,7 +3459,13 @@ def run_investigation_checklist(
 
     site_detected = _detect_site_from_hostname(safe_host) if safe_host else None
 
-    # ── IOC ENRICHMENT (VirusTotal + AbuseIPDB) ──────────────────────────
+    # ── IOC ENRICHMENT ──────────────────────────────────────────────────
+    # Provider routing (enforced inside _enrich_ioc):
+    #   • IPs        → AbuseIPDB only (VT quota conservation)
+    #   • Domains    → VirusTotal only
+    #   • URLs       → VirusTotal only
+    #   • Hashes     → VirusTotal only
+    #
     # Build the IOC list from extracted entities + IPs surfaced in telemetry
     # samples (SigninLogs IPAddress, DeviceNetworkEvents RemoteIP, etc.).
     # Capped per-type to stay within free-tier API limits.
@@ -2973,7 +3511,6 @@ def run_investigation_checklist(
     #   1. Incident entity list (entities.files, entities.processes)
     #   2. Telemetry sample rows (SHA256, SHA1, MD5, InitiatingProcessSHA256, etc.)
     #   3. Alert entity JSON (FileHash type entities)
-    # This ensures hashes from DeviceProcessEvents, DeviceFileEvents, etc. get enriched.
     hashes_found: List[Tuple[str, str]] = []
     _seen_hashes: set = set()
 
@@ -3016,7 +3553,7 @@ def run_investigation_checklist(
 
     # Run enrichment in parallel (rate-limited per provider internally)
     ioc_enrichment: Dict[str, dict] = {}
-    if ioc_list and (VIRUSTOTAL_API_KEY or ABUSEIPDB_API_KEY):
+    if ioc_list and (_VT_API_KEYS or ABUSEIPDB_API_KEY):
         enrichment_raw = _enrich_iocs_parallel(ioc_list, max_workers=4)
         for key, res in enrichment_raw.items():
             if res.get("ok"):
@@ -3063,6 +3600,12 @@ def run_investigation_checklist(
             "virustotal": bool(_VT_API_KEYS),
             "abuseipdb":  bool(ABUSEIPDB_API_KEY),
         },
+        "routing": {
+            "ip":     "abuseipdb_only",
+            "domain": "virustotal_only",
+            "url":    "virustotal_only",
+            "hash":   "virustotal_only",
+        },
     }
 
     return _ok({
@@ -3099,34 +3642,6 @@ def run_investigation_checklist(
         "similar_history_available": bool(hist_res.get("ok")),
     })
 
-_register_tool_def("debug_vt_pool",
-    "Shows VirusTotal API key pool status: call counts, cooldowns, readiness.", {})
-
-@mcp.tool
-def debug_vt_pool() -> dict:
-    now = time.time()
-    with _VT_POOL_LOCK:
-        states = []
-        for s in _VT_KEY_STATE:
-            ready_in = max(0.0, max(s["last_call"] + VT_MIN_INTERVAL_SEC,
-                                    s["cooldown_until"]) - now)
-            key_val = s["key"]
-            preview = (key_val[:6] + "..." + key_val[-4:]) if len(key_val) > 10 else "***"
-            states.append({
-                "index": s["index"],
-                "key_preview": preview,
-                "calls": s["calls"],
-                "rate_limited_count": s["rate_limited"],
-                "cooling_down": s["cooldown_until"] > now,
-                "ready_in_seconds": round(ready_in, 1),
-            })
-    return _ok({
-        "pool_size": len(_VT_KEY_STATE),
-        "min_interval_sec": VT_MIN_INTERVAL_SEC,
-        "effective_throughput_per_min": round(
-            len(_VT_KEY_STATE) * (60.0 / VT_MIN_INTERVAL_SEC), 1),
-        "keys": states,
-    })
 # ─────────────────────────────────────────────────────────────
 _register_tool_def("get_similar_incident_history",
     ("Looks up prior Sentinel incidents over the last N days that share the same title. "

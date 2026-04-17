@@ -3089,6 +3089,34 @@ def run_investigation_checklist(
         "similar_history_available": bool(hist_res.get("ok")),
     })
 
+_register_tool_def("debug_vt_pool",
+    "Shows VirusTotal API key pool status: call counts, cooldowns, readiness.", {})
+
+@mcp.tool
+def debug_vt_pool() -> dict:
+    now = time.time()
+    with _VT_POOL_LOCK:
+        states = []
+        for s in _VT_KEY_STATE:
+            ready_in = max(0.0, max(s["last_call"] + VT_MIN_INTERVAL_SEC,
+                                    s["cooldown_until"]) - now)
+            key_val = s["key"]
+            preview = (key_val[:6] + "..." + key_val[-4:]) if len(key_val) > 10 else "***"
+            states.append({
+                "index": s["index"],
+                "key_preview": preview,
+                "calls": s["calls"],
+                "rate_limited_count": s["rate_limited"],
+                "cooling_down": s["cooldown_until"] > now,
+                "ready_in_seconds": round(ready_in, 1),
+            })
+    return _ok({
+        "pool_size": len(_VT_KEY_STATE),
+        "min_interval_sec": VT_MIN_INTERVAL_SEC,
+        "effective_throughput_per_min": round(
+            len(_VT_KEY_STATE) * (60.0 / VT_MIN_INTERVAL_SEC), 1),
+        "keys": states,
+    })
 # ─────────────────────────────────────────────────────────────
 _register_tool_def("get_similar_incident_history",
     ("Looks up prior Sentinel incidents over the last N days that share the same title. "

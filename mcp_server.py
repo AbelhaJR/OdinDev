@@ -97,8 +97,76 @@ MAX_HOURS_INCIDENT = 168
 # IOC ENRICHMENT CONFIGURATION (VirusTotal + AbuseIPDB)
 # ============================================================
 
-VIRUSTOTAL_API_KEY = os.environ.get("VIRUSTOTAL_API_KEY", "")
-ABUSEIPDB_API_KEY  = os.environ.get("ABUSEIPDB_API_KEY", "")
+ABUSEIPDB_API_KEY = os.environ.get("ABUSEIPDB_API_KEY", "")
+
+def _load_vt_api_keys() -> List[str]:
+    """
+    Load VirusTotal API keys from env. Supports (in priority order):
+      1. VIRUSTOTAL_API_KEYS      — comma-separated list
+      2. VIRUSTOTAL_API_KEY_1..20 — numbered keys
+      3. VIRUSTOTAL_API_KEY       — single key (legacy / back-compat)
+    Duplicates removed, order preserved.
+    """
+    keys: List[str] = []
+
+    multi = os.environ.get("VIRUSTOTAL_API_KEYS", "").strip()
+    if multi:
+        for k in multi.split(","):
+            k = k.strip()
+            if k and k not in keys:
+                keys.append(k)
+
+    for i in range(1, 21):
+        k = os.environ.get(f"VIRUSTOTAL_API_KEY_{i}", "").strip()
+        if k and k not in keys:
+            keys.append(k)
+
+    legacy = os.environ.get("VIRUSTOTAL_API_KEY", "").strip()
+    if legacy and legacy not in keys:
+        keys.append(legacy)
+
+    return keys
+
+_VT_API_KEYS: List[str] = _load_vt_api_keys()
+
+# Per-key state for rate-limit tracking
+_VT_KEY_STATE: List[Dict[str, Any]] = [
+    {"key": k, "index": i, "last_call": 0.0, "cooldown_until": 0.0,
+     "calls": 0, "rate_limited": 0}
+    for i, k in enumerate(_VT_API_KEYS)
+]
+
+_VT_POOL_LOCK = threading.Lock()
+
+def _vt_acquire_key(min_interval: float, max_wait: float = 30.0) -> Optional[Dict[str, Any]]:
+    """
+    Pick the VT key that will be ready soonest, sleep if needed, stamp last_call.
+    Returns the key state dict, or None if the pool is empty.
+    """
+    if not _VT_KEY_STATE:
+        return None
+
+    with _VT_POOL_LOCK:
+        def ready_at(s: Dict[str, Any]) -> float:
+            return max(s["last_call"] + min_interval, s["cooldown_until"])
+
+        best = min(_VT_KEY_STATE, key=ready_at)
+        wait = ready_at(best) - time.time()
+
+        if wait > 0:
+            time.sleep(min(wait, max_wait))
+
+        best["last_call"] = time.time()
+        best["calls"] += 1
+        return best
+
+def _vt_mark_rate_limited(key_state: Dict[str, Any], retry_after_sec: float = 60.0) -> None:
+    """Put this key in cooldown after a 429."""
+    with _VT_POOL_LOCK:
+        key_state["cooldown_until"] = time.time() + retry_after_sec
+        key_state["rate_limited"] += 1
+    logger.warning("VT key idx=%s rate-limited, cooldown=%.0fs",
+                   key_state.get("index"), retry_after_sec)
 
 # Cache TTL in seconds (default 1h)
 IOC_CACHE_TTL = int(os.environ.get("IOC_CACHE_TTL", "3600"))
@@ -949,7 +1017,6 @@ def _detect_ioc_type(value: str) -> str:
     return "unknown"
 
 # ── VirusTotal ────────────────────────────────────────────────────────
-
 def _vt_parse_analysis(attributes: dict) -> dict:
     """Extract the fields we care about from a VT /attributes block."""
     stats = attributes.get("last_analysis_stats") or {}
@@ -974,13 +1041,14 @@ def _vt_parse_analysis(attributes: dict) -> dict:
         "type_description":   attributes.get("type_description"),
     }
 
+
 def _enrich_virustotal(value: str, ioc_type: str) -> dict:
     """
-    Query VirusTotal for IP, domain, URL, or hash.
-    Returns {"ok": True, "data": {...}} or {"ok": False, "error": "..."}.
+    Query VirusTotal for IP, domain, URL, or hash — with automatic key rotation.
+    On 429, marks the current key as cooling down and retries with the next one.
     """
-    if not VIRUSTOTAL_API_KEY:
-        return {"ok": False, "error": "VIRUSTOTAL_API_KEY not configured",
+    if not _VT_API_KEYS:
+        return {"ok": False, "error": "No VirusTotal API keys configured",
                 "skipped": True}
 
     cache_key = f"vt:{ioc_type}:{value.lower()}"
@@ -1002,74 +1070,94 @@ def _enrich_virustotal(value: str, ioc_type: str) -> dict:
     else:
         return {"ok": False, "error": f"Unsupported IOC type for VT: {ioc_type}"}
 
-    _ioc_rate_wait("virustotal", VT_MIN_INTERVAL_SEC)
+    # Retry across up to min(pool_size, 3) keys on rate-limit / transient error
+    last_error = None
+    max_attempts = min(len(_VT_API_KEYS), 3)
 
-    try:
-        resp = SESSION.get(
-            f"https://www.virustotal.com/api/v3/{path}",
-            headers={"x-apikey": VIRUSTOTAL_API_KEY,
-                     "Accept": "application/json"},
-            timeout=IOC_HTTP_TIMEOUT,
-        )
-    except Exception as e:
-        return {"ok": False, "error": f"HTTP error: {e}"}
+    for attempt in range(max_attempts):
+        key_state = _vt_acquire_key(VT_MIN_INTERVAL_SEC)
+        if not key_state:
+            return {"ok": False, "error": "No VT keys available"}
 
-    if resp.status_code == 404:
+        try:
+            resp = SESSION.get(
+                f"https://www.virustotal.com/api/v3/{path}",
+                headers={"x-apikey": key_state["key"],
+                         "Accept": "application/json"},
+                timeout=IOC_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            last_error = f"HTTP error on key idx={key_state['index']}: {e}"
+            continue
+
+        # 429 → cooldown this key, try the next
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                cooldown = float(retry_after) if retry_after else 60.0
+            except ValueError:
+                cooldown = 60.0
+            _vt_mark_rate_limited(key_state, cooldown)
+            last_error = f"429 on key idx={key_state['index']}, rotating"
+            continue
+
+        if resp.status_code == 401:
+            return {"ok": False,
+                    "error": f"VirusTotal auth failed on key idx={key_state['index']}"}
+
+        if resp.status_code == 404:
+            result = {
+                "provider": "virustotal",
+                "ioc": value,
+                "ioc_type": ioc_type,
+                "status": "not_found",
+                "summary": "Not seen by VirusTotal",
+            }
+            _ioc_cache_set(cache_key, result)
+            return {"ok": True, "data": result}
+
+        if not resp.ok:
+            return {"ok": False,
+                    "error": f"VirusTotal HTTP {resp.status_code}: {resp.text[:200]}"}
+
+        # Success
+        try:
+            payload = resp.json()
+        except Exception as e:
+            return {"ok": False, "error": f"VT JSON parse error: {e}"}
+
+        attrs = (payload.get("data") or {}).get("attributes") or {}
+        analysis = _vt_parse_analysis(attrs)
+        malicious = analysis["malicious_engines"]
+
         result = {
             "provider": "virustotal",
             "ioc": value,
             "ioc_type": ioc_type,
-            "status": "not_found",
-            "summary": "Not seen by VirusTotal",
+            "status": "found",
+            "malicious_engines":  malicious,
+            "suspicious_engines": analysis["suspicious_engines"],
+            "harmless_engines":   analysis["harmless_engines"],
+            "community_malicious_votes": analysis["community_malicious_votes"],
+            "reputation":         analysis["reputation"],
+            "last_analysis_date": analysis["last_analysis_date"],
+            "first_seen":         analysis["first_seen"],
+            "tags":               analysis["tags"],
+            "categories":         analysis["categories"],
+            "as_owner":           analysis["as_owner"],
+            "asn":                analysis["asn"],
+            "country":            analysis["country"],
+            "meaningful_name":    analysis["meaningful_name"],
+            "type_description":   analysis["type_description"],
+            "verdict": ("malicious" if malicious >= VT_MALICIOUS_VOTES_THRESHOLD
+                        else "suspicious" if malicious > 0 or analysis["suspicious_engines"] > 0
+                        else "clean"),
+            "gui_link": f"https://www.virustotal.com/gui/{'ip-address' if ioc_type=='ip' else ioc_type}/{value}",
         }
         _ioc_cache_set(cache_key, result)
         return {"ok": True, "data": result}
 
-    if resp.status_code == 429:
-        return {"ok": False, "error": "VirusTotal rate limit hit (429)"}
-
-    if resp.status_code == 401:
-        return {"ok": False, "error": "VirusTotal auth failed (check API key)"}
-
-    if not resp.ok:
-        return {"ok": False, "error": f"VirusTotal HTTP {resp.status_code}: {resp.text[:200]}"}
-
-    try:
-        payload = resp.json()
-    except Exception as e:
-        return {"ok": False, "error": f"VT JSON parse error: {e}"}
-
-    attrs = (payload.get("data") or {}).get("attributes") or {}
-    analysis = _vt_parse_analysis(attrs)
-    malicious = analysis["malicious_engines"]
-
-    result = {
-        "provider": "virustotal",
-        "ioc": value,
-        "ioc_type": ioc_type,
-        "status": "found",
-        "malicious_engines":  malicious,
-        "suspicious_engines": analysis["suspicious_engines"],
-        "harmless_engines":   analysis["harmless_engines"],
-        "community_malicious_votes": analysis["community_malicious_votes"],
-        "reputation":         analysis["reputation"],
-        "last_analysis_date": analysis["last_analysis_date"],
-        "first_seen":         analysis["first_seen"],
-        "tags":               analysis["tags"],
-        "categories":         analysis["categories"],
-        "as_owner":           analysis["as_owner"],
-        "asn":                analysis["asn"],
-        "country":            analysis["country"],
-        "meaningful_name":    analysis["meaningful_name"],
-        "type_description":   analysis["type_description"],
-        "verdict":            ("malicious" if malicious >= VT_MALICIOUS_VOTES_THRESHOLD
-                               else "suspicious" if malicious > 0 or analysis["suspicious_engines"] > 0
-                               else "clean"),
-        "gui_link":           f"https://www.virustotal.com/gui/{'ip-address' if ioc_type=='ip' else ioc_type}/{value}",
-    }
-
-    _ioc_cache_set(cache_key, result)
-    return {"ok": True, "data": result}
+    return {"ok": False, "error": last_error or "All VT keys exhausted"}
 
 # ── AbuseIPDB ─────────────────────────────────────────────────────────
 

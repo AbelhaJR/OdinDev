@@ -3723,346 +3723,359 @@ def run_investigation_checklist(
     if hours <= 0 or hours > MAX_HOURS_INCIDENT:
         return _fail(f"Timespan too large (max {MAX_HOURS_INCIDENT}h)", code="VALIDATION_ERROR")
 
-    inc_res     = investigate_incident(incident_id, timespan=timespan)
-    hist_res    = get_similar_incident_history(incident_id, days=30)
+    with tracer.start("run_investigation_checklist"):
+        inc_res     = investigate_incident(incident_id, timespan=timespan)
+        hist_res    = get_similar_incident_history(incident_id, days=30)
 
-    if not inc_res.get("ok"):
-        return inc_res
+        if not inc_res.get("ok"):
+            return inc_res
 
-    inc_data    = inc_res.get("data") or {}
-    incident    = inc_data.get("incident") or {}
-    ents        = inc_data.get("entities") or {}
-    alert_names = list((inc_data.get("alerts") or {}).get("names") or [])
-    tactics     = list((inc_data.get("mitre") or {}).get("tactics") or [])
-    techniques  = list((inc_data.get("mitre") or {}).get("techniques") or [])
+        inc_data    = inc_res.get("data") or {}
+        incident    = inc_data.get("incident") or {}
+        ents        = inc_data.get("entities") or {}
+        alert_names = list((inc_data.get("alerts") or {}).get("names") or [])
+        tactics     = list((inc_data.get("mitre") or {}).get("tactics") or [])
+        techniques  = list((inc_data.get("mitre") or {}).get("techniques") or [])
 
-    # Pass incident title to the auto-detect so it can use the real rule name
-    # rather than relying on ProductName which is always "Azure Sentinel".
-    incident_title = str(incident.get("title") or "")
+        # Pass incident title to the auto-detect so it can use the real rule name
+        # rather than relying on ProductName which is always "Azure Sentinel".
+        incident_title = str(incident.get("title") or "")
 
-    hosts   = ents.get("hosts") or []
-    users   = ents.get("users") or []
-    ips     = ents.get("ips")   or []
-    domains = ents.get("domains") or []
+        hosts   = ents.get("hosts") or []
+        users   = ents.get("users") or []
+        ips     = ents.get("ips")   or []
+        domains = ents.get("domains") or []
 
-    hosts = [_normalize_entity_value(h) for h in hosts]
-    users = [_normalize_entity_value(u) for u in users]
+        hosts = [_normalize_entity_value(h) for h in hosts]
+        users = [_normalize_entity_value(u) for u in users]
 
-    safe_host   = escape_kql_string(hosts[0].lower().split(".")[0]) if hosts else ""
-    safe_user   = escape_kql_string(users[0]) if users else ""
-    safe_ip     = escape_kql_string(ips[0])   if ips   else ""
-    safe_domain = escape_kql_string(domains[0]) if domains else ""
-    safe_hash   = ""
+        safe_host   = escape_kql_string(hosts[0].lower().split(".")[0]) if hosts else ""
+        safe_user   = escape_kql_string(users[0]) if users else ""
+        safe_ip     = escape_kql_string(ips[0])   if ips   else ""
+        safe_domain = escape_kql_string(domains[0]) if domains else ""
+        safe_hash   = ""
 
-    cl = (checklist or "auto").strip().lower()
-    if cl == "auto":
-        cl = _auto_detect_checklist(alert_names, tactics, incident_title=incident_title)
+        cl = (checklist or "auto").strip().lower()
+        if cl == "auto":
+            cl = _auto_detect_checklist(alert_names, tactics, incident_title=incident_title)
 
-    ts_short = "PT12H"
-    ts_long  = "P1D"
+        ts_short = "PT12H"
+        ts_long  = "P1D"
 
-    if cl == "execution":
-        tasks = _checklist_execution(safe_host, safe_user, ts_short, ts_long)
-    elif cl == "identity":
-        tasks = _checklist_identity(safe_user, safe_ip, safe_host, ts_long)
-    elif cl == "lateral_movement":
-        tasks = _checklist_lateral_movement(safe_host, safe_user)
-    elif cl == "network":
-        tasks = _checklist_network(safe_host, safe_ip, safe_domain)
-    elif cl == "malware":
-        tasks = _checklist_malware(safe_host, safe_user, safe_hash, ts_short)
-    elif cl == "cloud":
-        tasks = _checklist_cloud(safe_user, safe_ip)
-    elif cl == "behavioral":
-        tasks = _checklist_behavioral(safe_user, safe_host)
-    else:
-        tasks = _checklist_default(safe_host, safe_user, safe_ip)
+        if cl == "execution":
+            tasks = _checklist_execution(safe_host, safe_user, ts_short, ts_long)
+        elif cl == "identity":
+            tasks = _checklist_identity(safe_user, safe_ip, safe_host, ts_long)
+        elif cl == "lateral_movement":
+            tasks = _checklist_lateral_movement(safe_host, safe_user)
+        elif cl == "network":
+            tasks = _checklist_network(safe_host, safe_ip, safe_domain)
+        elif cl == "malware":
+            tasks = _checklist_malware(safe_host, safe_user, safe_hash, ts_short)
+        elif cl == "cloud":
+            tasks = _checklist_cloud(safe_user, safe_ip)
+        elif cl == "behavioral":
+            tasks = _checklist_behavioral(safe_user, safe_host)
+        else:
+            tasks = _checklist_default(safe_host, safe_user, safe_ip)
 
-    tasks = _append_site_cl_tasks(tasks, safe_host)
+        tasks = _append_site_cl_tasks(tasks, safe_host)
 
-    raw_results = _run_checklist_tasks(tasks, timespan)
+        raw_results = _run_checklist_tasks(tasks, timespan)
 
-    buckets: Dict[str, dict] = {}
-    for task in tasks:
-        bid = task["bucket"]
-        buckets[bid] = _summarise_bucket(bid, raw_results.get(bid), compact=compact)
+        buckets: Dict[str, dict] = {}
+        for task in tasks:
+            bid = task["bucket"]
+            buckets[bid] = _summarise_bucket(bid, raw_results.get(bid), compact=compact)
 
-    escalation_triggers = []
-    sa_bucket = buckets.get("security_alerts_30d", {})
-    if sa_bucket.get("status") == "ok":
-        for row in (sa_bucket.get("sample") or []):
-            name = str(row.get("AlertName") or "").lower()
-            desc = str(row.get("Description") or "").lower()
-            for trigger in ["cobalt strike", "hands-on-keyboard", "amsi bypass",
-                            "ransomware", "dll hijack", "suspicious dll load",
-                            "lsass", "mimikatz"]:
-                if trigger in name or trigger in desc:
-                    escalation_triggers.append({
-                        "trigger": trigger,
-                        "alert":   row.get("AlertName"),
-                        "time":    row.get("TimeGenerated"),
-                    })
+        escalation_triggers = []
+        sa_bucket = buckets.get("security_alerts_30d", {})
+        if sa_bucket.get("status") == "ok":
+            for row in (sa_bucket.get("sample") or []):
+                name = str(row.get("AlertName") or "").lower()
+                desc = str(row.get("Description") or "").lower()
+                for trigger in ["cobalt strike", "hands-on-keyboard", "amsi bypass",
+                                "ransomware", "dll hijack", "suspicious dll load",
+                                "lsass", "mimikatz"]:
+                    if trigger in name or trigger in desc:
+                        escalation_triggers.append({
+                            "trigger": trigger,
+                            "alert":   row.get("AlertName"),
+                            "time":    row.get("TimeGenerated"),
+                        })
 
-    expanded_buckets = []
-    for bid in ["process_events", "file_events", "registry_events",
-                "device_events", "logon_events"]:
-        if bid in buckets and buckets[bid].get("rows", 0) == 0:
-            expand_task = next((t for t in tasks if t["bucket"] == bid), None)
-            if expand_task and expand_task.get("type") == "run_query":
-                exp_res = la_query(expand_task["kql"], "P1D")
-                buckets[f"{bid}_expanded"] = _summarise_bucket(
-                    f"{bid}_expanded", exp_res, compact=compact
-                )
-                expanded_buckets.append(bid)
+        expanded_buckets = []
+        for bid in ["process_events", "file_events", "registry_events",
+                    "device_events", "logon_events"]:
+            if bid in buckets and buckets[bid].get("rows", 0) == 0:
+                expand_task = next((t for t in tasks if t["bucket"] == bid), None)
+                if expand_task and expand_task.get("type") == "run_query":
+                    exp_res = la_query(expand_task["kql"], "P1D")
+                    buckets[f"{bid}_expanded"] = _summarise_bucket(
+                        f"{bid}_expanded", exp_res, compact=compact
+                    )
+                    expanded_buckets.append(bid)
 
-    surfaced_hosts = _scan_for_surfaced_hosts(buckets, hosts)
-    surfaced_cmdb = []
-    for sh in surfaced_hosts:
-        res = _query_cmdb_entity(sh)
-        if res.get("ok"):
-            rows = _la_first_table_dicts(res["data"])
-            if rows:
-                # In compact mode: keep only row count + first hit with top fields.
-                # Full mode: keep top 3 rows verbatim (original behavior).
-                if compact:
-                    top_row = rows[0]
-                    trimmed = {k: v for k, v in top_row.items()
-                               if k in ("Key", "FQDN", "BusinessEntity",
-                                        "Management_IP", "logsource", "PSNC")
-                               and v not in (None, "", [])}
-                    surfaced_cmdb.append({
-                        "host": sh, "cmdb_rows": len(rows), "top": trimmed
-                    })
-                else:
-                    surfaced_cmdb.append({
-                        "host": sh, "cmdb_rows": len(rows), "sample": rows[:3]
-                    })
+        surfaced_hosts = _scan_for_surfaced_hosts(buckets, hosts)
+        surfaced_cmdb = []
+        for sh in surfaced_hosts:
+            res = _query_cmdb_entity(sh)
+            if res.get("ok"):
+                rows = _la_first_table_dicts(res["data"])
+                if rows:
+                    # In compact mode: keep only row count + first hit with top fields.
+                    # Full mode: keep top 3 rows verbatim (original behavior).
+                    if compact:
+                        top_row = rows[0]
+                        trimmed = {k: v for k, v in top_row.items()
+                                   if k in ("Key", "FQDN", "BusinessEntity",
+                                            "Management_IP", "logsource", "PSNC")
+                                   and v not in (None, "", [])}
+                        surfaced_cmdb.append({
+                            "host": sh, "cmdb_rows": len(rows), "top": trimmed
+                        })
+                    else:
+                        surfaced_cmdb.append({
+                            "host": sh, "cmdb_rows": len(rows), "sample": rows[:3]
+                        })
 
-    site_detected = _detect_site_from_hostname(safe_host) if safe_host else None
+        site_detected = _detect_site_from_hostname(safe_host) if safe_host else None
 
-    # ── IOC ENRICHMENT ──────────────────────────────────────────────────
-    # Provider routing (enforced inside _enrich_ioc):
-    #   • IPs        → AbuseIPDB only (VT quota conservation)
-    #   • Domains    → VirusTotal only
-    #   • URLs       → VirusTotal only
-    #   • Hashes     → VirusTotal only
-    #
-    # Build the IOC list from extracted entities + IPs surfaced in telemetry
-    # samples (SigninLogs IPAddress, DeviceNetworkEvents RemoteIP, etc.).
-    # Capped per-type to stay within free-tier API limits.
-    ioc_list: List[Tuple[str, str]] = []
-    seen_iocs = set()
+        # ── IOC ENRICHMENT ──────────────────────────────────────────────────
+        # Provider routing (enforced inside _enrich_ioc):
+        #   • IPs        → AbuseIPDB only (VT quota conservation)
+        #   • Domains    → VirusTotal only
+        #   • URLs       → VirusTotal only
+        #   • Hashes     → VirusTotal only
+        #
+        # Build the IOC list from extracted entities + IPs surfaced in telemetry
+        # samples (SigninLogs IPAddress, DeviceNetworkEvents RemoteIP, etc.).
+        # Capped per-type to stay within free-tier API limits.
+        ioc_list: List[Tuple[str, str]] = []
+        seen_iocs = set()
 
-    def _add_ioc(val: str, vt_type: str):
-        if not val:
-            return
-        norm = _normalize_entity_value(str(val))
-        if not norm or norm.lower() in seen_iocs:
-            return
-        seen_iocs.add(norm.lower())
-        ioc_list.append((norm, vt_type))
+        def _add_ioc(val: str, vt_type: str):
+            if not val:
+                return
+            norm = _normalize_entity_value(str(val))
+            if not norm or norm.lower() in seen_iocs:
+                return
+            seen_iocs.add(norm.lower())
+            ioc_list.append((norm, vt_type))
 
-    # IPs — primary + up to N from entities + surfaced from telemetry
-    ips_to_enrich: List[str] = []
-    if safe_ip:
-        ips_to_enrich.append(safe_ip)
-    for ip in (ips or []):
-        if ip and ip not in ips_to_enrich:
-            ips_to_enrich.append(ip)
-    # Pull IPs that appeared in telemetry samples
-    ip_fields = ["IPAddress", "IpAddress", "RemoteIP", "ClientIP", "CallerIpAddress",
-                 "SourceIP", "LocalIP"]
-    for bid, b in buckets.items():
-        for row in (b.get("sample") or []):
-            for f in ip_fields:
-                v = row.get(f)
-                if isinstance(v, str) and re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", v):
-                    if v not in ips_to_enrich:
-                        ips_to_enrich.append(v)
-        if len(ips_to_enrich) >= IOC_MAX_IPS_PER_INCIDENT * 3:
-            break
-    for ip in ips_to_enrich[:IOC_MAX_IPS_PER_INCIDENT]:
-        _add_ioc(ip, "ip")
+        # IPs — primary + up to N from entities + surfaced from telemetry
+        ips_to_enrich: List[str] = []
+        if safe_ip:
+            ips_to_enrich.append(safe_ip)
+        for ip in (ips or []):
+            if ip and ip not in ips_to_enrich:
+                ips_to_enrich.append(ip)
+        # Pull IPs that appeared in telemetry samples
+        ip_fields = ["IPAddress", "IpAddress", "RemoteIP", "ClientIP", "CallerIpAddress",
+                     "SourceIP", "LocalIP"]
+        for bid, b in buckets.items():
+            for row in (b.get("sample") or []):
+                for f in ip_fields:
+                    v = row.get(f)
+                    if isinstance(v, str) and re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", v):
+                        if v not in ips_to_enrich:
+                            ips_to_enrich.append(v)
+            if len(ips_to_enrich) >= IOC_MAX_IPS_PER_INCIDENT * 3:
+                break
+        for ip in ips_to_enrich[:IOC_MAX_IPS_PER_INCIDENT]:
+            _add_ioc(ip, "ip")
 
-    # Domains — cap at N
-    for dom in (domains or [])[:IOC_MAX_DOMAINS_PER_INCIDENT]:
-        _add_ioc(dom, "domain")
+        # Domains — cap at N
+        for dom in (domains or [])[:IOC_MAX_DOMAINS_PER_INCIDENT]:
+            _add_ioc(dom, "domain")
 
-    # Hashes — look in FOUR places (priority order, highest first):
-    #   0. Incident alert JSON — entities.hashes (from shared extraction
-    #      helper; catches hashes nested in Process.ImageFile.FileHashes[]
-    #      and standalone FileHash entities that the old path missed)
-    #   1. Incident entity list — entities.files, entities.processes
-    #      (only catches hash-shaped file names)
-    #   2. Telemetry sample rows (SHA256, SHA1, MD5,
-    #      InitiatingProcessSHA256, etc.)
-    hashes_found: List[Tuple[str, str]] = []
-    _seen_hashes: set = set()
+        # Hashes — look in FOUR places (priority order, highest first):
+        #   0. Incident alert JSON — entities.hashes (from shared extraction
+        #      helper; catches hashes nested in Process.ImageFile.FileHashes[]
+        #      and standalone FileHash entities that the old path missed)
+        #   1. Incident entity list — entities.files, entities.processes
+        #      (only catches hash-shaped file names)
+        #   2. Telemetry sample rows (SHA256, SHA1, MD5,
+        #      InitiatingProcessSHA256, etc.)
+        hashes_found: List[Tuple[str, str]] = []
+        _seen_hashes: set = set()
 
-    def _collect_hash(val: str):
-        if not val or not isinstance(val, str):
-            return
-        v = val.strip()
-        if v.lower() in _seen_hashes:
-            return
-        t = _detect_ioc_type(v)
-        if t in ("sha256", "sha1", "md5"):
-            _seen_hashes.add(v.lower())
-            hashes_found.append((v, t))
+        def _collect_hash(val: str):
+            if not val or not isinstance(val, str):
+                return
+            v = val.strip()
+            if v.lower() in _seen_hashes:
+                return
+            t = _detect_ioc_type(v)
+            if t in ("sha256", "sha1", "md5"):
+                _seen_hashes.add(v.lower())
+                hashes_found.append((v, t))
 
-    # Source 0: hashes extracted by the shared entity helper (highest-fidelity —
-    # these are guaranteed-real hashes from File.FileHashes[] in alert JSON)
-    for v in (ents.get("hashes") or []):
-        _collect_hash(str(v))
-
-    # Source 1: entity list — only catches hash-shaped strings in file/process names
-    for entity_list in [(ents.get("files") or []),
-                        (ents.get("processes") or [])]:
-        for v in entity_list:
+        # Source 0: hashes extracted by the shared entity helper (highest-fidelity —
+        # these are guaranteed-real hashes from File.FileHashes[] in alert JSON)
+        for v in (ents.get("hashes") or []):
             _collect_hash(str(v))
 
-    # Source 2: telemetry samples — scan for known hash column names
-    hash_fields = [
-        "SHA256", "SHA1", "MD5",
-        "InitiatingProcessSHA256", "InitiatingProcessSHA1", "InitiatingProcessMD5",
-        "FileHashSha256", "FileHashSha1", "FileHashMd5",
-        "FileSHA256",
-    ]
-    for bid, b in buckets.items():
-        for row in (b.get("sample") or []):
-            for f in hash_fields:
-                v = row.get(f)
-                if v:
-                    _collect_hash(str(v))
-        # Stop scanning once we have enough candidates
-        if len(hashes_found) >= IOC_MAX_HASHES_PER_INCIDENT * 3:
-            break
+        # Source 1: entity list — only catches hash-shaped strings in file/process names
+        for entity_list in [(ents.get("files") or []),
+                            (ents.get("processes") or [])]:
+            for v in entity_list:
+                _collect_hash(str(v))
 
-    for h, ht in hashes_found[:IOC_MAX_HASHES_PER_INCIDENT]:
-        _add_ioc(h, ht)
+        # Source 2: telemetry samples — scan for known hash column names
+        hash_fields = [
+            "SHA256", "SHA1", "MD5",
+            "InitiatingProcessSHA256", "InitiatingProcessSHA1", "InitiatingProcessMD5",
+            "FileHashSha256", "FileHashSha1", "FileHashMd5",
+            "FileSHA256",
+        ]
+        for bid, b in buckets.items():
+            for row in (b.get("sample") or []):
+                for f in hash_fields:
+                    v = row.get(f)
+                    if v:
+                        _collect_hash(str(v))
+            # Stop scanning once we have enough candidates
+            if len(hashes_found) >= IOC_MAX_HASHES_PER_INCIDENT * 3:
+                break
 
-    # Run enrichment in parallel (rate-limited per provider internally)
-    ioc_enrichment: Dict[str, dict] = {}
+        for h, ht in hashes_found[:IOC_MAX_HASHES_PER_INCIDENT]:
+            _add_ioc(h, ht)
 
-    def _compact_ioc_data(d: dict) -> dict:
-        """
-        Strip bulky/debug-ish fields from an IOC enrichment dict. Keeps
-        only the fields analysts actually reference in reports.
-        """
-        if not isinstance(d, dict):
-            return d
-        out = {"ioc": d.get("ioc"), "ioc_type": d.get("ioc_type"),
-               "verdict": d.get("verdict"), "escalate": d.get("escalate")}
-        vt = d.get("virustotal")
-        if isinstance(vt, dict):
-            out["virustotal"] = {
-                k: vt.get(k) for k in (
-                    "provider", "status", "malicious_engines",
-                    "suspicious_engines", "as_owner", "country",
-                    "gui_link", "reason", "error"
-                ) if vt.get(k) is not None
-            }
-        ab = d.get("abuseipdb")
-        if isinstance(ab, dict):
-            out["abuseipdb"] = {
-                k: ab.get(k) for k in (
-                    "provider", "status", "abuse_confidence_score",
-                    "total_reports", "country_code", "isp", "usage_type",
-                    "is_tor", "gui_link", "error"
-                ) if ab.get(k) is not None
-            }
-        return out
+        # Run enrichment in parallel (rate-limited per provider internally)
+        ioc_enrichment: Dict[str, dict] = {}
 
-    if ioc_list and (_VT_API_KEYS or ABUSEIPDB_API_KEY):
-        enrichment_raw = _enrich_iocs_parallel(ioc_list, max_workers=4)
-        for key, res in enrichment_raw.items():
-            if res.get("ok"):
-                data = res["data"]
-                ioc_enrichment[key] = _compact_ioc_data(data) if compact else data
-            else:
-                ioc_enrichment[key] = {
-                    "ioc": key,
-                    "status": "error",
-                    "error": res.get("error"),
+        def _compact_ioc_data(d: dict) -> dict:
+            """
+            Strip bulky/debug-ish fields from an IOC enrichment dict. Keeps
+            only the fields analysts actually reference in reports.
+            """
+            if not isinstance(d, dict):
+                return d
+            out = {"ioc": d.get("ioc"), "ioc_type": d.get("ioc_type"),
+                   "verdict": d.get("verdict"), "escalate": d.get("escalate")}
+            vt = d.get("virustotal")
+            if isinstance(vt, dict):
+                out["virustotal"] = {
+                    k: vt.get(k) for k in (
+                        "provider", "status", "malicious_engines",
+                        "suspicious_engines", "as_owner", "country",
+                        "gui_link", "reason", "error"
+                    ) if vt.get(k) is not None
                 }
+            ab = d.get("abuseipdb")
+            if isinstance(ab, dict):
+                out["abuseipdb"] = {
+                    k: ab.get(k) for k in (
+                        "provider", "status", "abuse_confidence_score",
+                        "total_reports", "country_code", "isp", "usage_type",
+                        "is_tor", "gui_link", "error"
+                    ) if ab.get(k) is not None
+                }
+            return out
 
-    # Feed malicious IOCs into the escalation trigger list
-    for ioc_key, ioc_data in ioc_enrichment.items():
-        if not isinstance(ioc_data, dict):
-            continue
-        if ioc_data.get("escalate") is True:
-            vt = ioc_data.get("virustotal") or {}
-            ab = ioc_data.get("abuseipdb") or {}
-            escalation_triggers.append({
-                "trigger": "ioc_malicious",
-                "ioc":     ioc_key,
-                "ioc_type":ioc_data.get("ioc_type"),
-                "verdict": ioc_data.get("verdict"),
-                "vt_malicious_engines":  vt.get("malicious_engines") if isinstance(vt, dict) else None,
-                "abuseipdb_score":       ab.get("abuse_confidence_score") if isinstance(ab, dict) else None,
-                "vt_link":  vt.get("gui_link") if isinstance(vt, dict) else None,
-                "ab_link":  ab.get("gui_link") if isinstance(ab, dict) else None,
-            })
+        if ioc_list and (_VT_API_KEYS or ABUSEIPDB_API_KEY):
+            enrichment_raw = _enrich_iocs_parallel(ioc_list, max_workers=4)
+            for key, res in enrichment_raw.items():
+                if res.get("ok"):
+                    data = res["data"]
+                    ioc_enrichment[key] = _compact_ioc_data(data) if compact else data
+                else:
+                    ioc_enrichment[key] = {
+                        "ioc": key,
+                        "status": "error",
+                        "error": res.get("error"),
+                    }
 
-    # Summary counts for the agent
-    ioc_summary = {
-        "total":         len(ioc_enrichment),
-        "malicious":     sum(1 for v in ioc_enrichment.values()
-                             if isinstance(v, dict) and v.get("verdict") == "malicious"),
-        "suspicious":    sum(1 for v in ioc_enrichment.values()
-                             if isinstance(v, dict) and v.get("verdict") == "suspicious"),
-        "clean":         sum(1 for v in ioc_enrichment.values()
-                             if isinstance(v, dict) and v.get("verdict") == "clean"),
-        "unknown":       sum(1 for v in ioc_enrichment.values()
-                             if isinstance(v, dict) and v.get("verdict") == "unknown"),
-        "errors":        sum(1 for v in ioc_enrichment.values()
-                             if isinstance(v, dict) and v.get("status") == "error"),
-        "providers_enabled": {
-            "virustotal": bool(_VT_API_KEYS),
-            "abuseipdb":  bool(ABUSEIPDB_API_KEY),
-        },
-        "routing": {
-            "ip":     "abuseipdb_only",
-            "domain": "virustotal_only",
-            "url":    "virustotal_only",
-            "hash":   "virustotal_only",
-        },
-    }
+        # Feed malicious IOCs into the escalation trigger list
+        for ioc_key, ioc_data in ioc_enrichment.items():
+            if not isinstance(ioc_data, dict):
+                continue
+            if ioc_data.get("escalate") is True:
+                vt = ioc_data.get("virustotal") or {}
+                ab = ioc_data.get("abuseipdb") or {}
+                escalation_triggers.append({
+                    "trigger": "ioc_malicious",
+                    "ioc":     ioc_key,
+                    "ioc_type":ioc_data.get("ioc_type"),
+                    "verdict": ioc_data.get("verdict"),
+                    "vt_malicious_engines":  vt.get("malicious_engines") if isinstance(vt, dict) else None,
+                    "abuseipdb_score":       ab.get("abuse_confidence_score") if isinstance(ab, dict) else None,
+                    "vt_link":  vt.get("gui_link") if isinstance(vt, dict) else None,
+                    "ab_link":  ab.get("gui_link") if isinstance(ab, dict) else None,
+                })
 
-    return _ok({
-        "incident_id":          incident_id,
-        "incident_title":       incident_title,
-        "checklist_used":       cl,
-        "checklist_auto":       checklist == "auto",
-        "compact":              compact,
-        "site_detected":        site_detected,
-        "entities_extracted": {
-            "hosts":        hosts,
-            "users":        users,
-            "ips":          ips,
-            "domains":      domains,
-            "primary_host": safe_host,
-            "primary_user": safe_user,
-            "primary_ip":   safe_ip,
-        },
-        "mitre": {
-            "tactics":    tactics,
-            "techniques": techniques,
-        },
-        "telemetry":            buckets,
-        "escalation_triggers":  escalation_triggers,
-        "escalation_fired":     bool(escalation_triggers),
-        "expanded_buckets":     expanded_buckets,
-        "surfaced_hosts":       surfaced_hosts,
-        "surfaced_hosts_cmdb":  surfaced_cmdb,
-        "ioc_enrichment":       ioc_enrichment,
-        "ioc_summary":          ioc_summary,
-        "checklist_coverage": {
-            t["bucket"]: buckets.get(t["bucket"], {}).get("status", "missing")
-            for t in tasks
-        },
-        "similar_history_available": bool(hist_res.get("ok")),
-    })
+        # Summary counts for the agent
+        ioc_summary = {
+            "total":         len(ioc_enrichment),
+            "malicious":     sum(1 for v in ioc_enrichment.values()
+                                 if isinstance(v, dict) and v.get("verdict") == "malicious"),
+            "suspicious":    sum(1 for v in ioc_enrichment.values()
+                                 if isinstance(v, dict) and v.get("verdict") == "suspicious"),
+            "clean":         sum(1 for v in ioc_enrichment.values()
+                                 if isinstance(v, dict) and v.get("verdict") == "clean"),
+            "unknown":       sum(1 for v in ioc_enrichment.values()
+                                 if isinstance(v, dict) and v.get("verdict") == "unknown"),
+            "errors":        sum(1 for v in ioc_enrichment.values()
+                                 if isinstance(v, dict) and v.get("status") == "error"),
+            "providers_enabled": {
+                "virustotal": bool(_VT_API_KEYS),
+                "abuseipdb":  bool(ABUSEIPDB_API_KEY),
+            },
+            "routing": {
+                "ip":     "abuseipdb_only",
+                "domain": "virustotal_only",
+                "url":    "virustotal_only",
+                "hash":   "virustotal_only",
+            },
+        }
+
+        # ─── Build the payload (your original return dict, assigned to a var) ───
+        payload = {
+            "incident_id":          incident_id,
+            "incident_title":       incident_title,
+            "checklist_used":       cl,
+            "checklist_auto":       checklist == "auto",
+            "compact":              compact,
+            "site_detected":        site_detected,
+            "entities_extracted": {
+                "hosts":        hosts,
+                "users":        users,
+                "ips":          ips,
+                "domains":      domains,
+                "primary_host": safe_host,
+                "primary_user": safe_user,
+                "primary_ip":   safe_ip,
+            },
+            "mitre": {
+                "tactics":    tactics,
+                "techniques": techniques,
+            },
+            "telemetry":            buckets,
+            "escalation_triggers":  escalation_triggers,
+            "escalation_fired":     bool(escalation_triggers),
+            "expanded_buckets":     expanded_buckets,
+            "surfaced_hosts":       surfaced_hosts,
+            "surfaced_hosts_cmdb":  surfaced_cmdb,
+            "ioc_enrichment":       ioc_enrichment,
+            "ioc_summary":          ioc_summary,
+            "checklist_coverage": {
+                t["bucket"]: buckets.get(t["bucket"], {}).get("status", "missing")
+                for t in tasks
+            },
+            "similar_history_available": bool(hist_res.get("ok")),
+            "alerts_count":         len((inc_data.get("alerts") or {}).get("names") or []),
+            # Attach the investigate_incident() output so the report has
+            # severity/owner/status/created_time out of the box.
+            "incident_details":     inc_data,
+        }
+
+        # ─── Finalize trace + render HTML report ──────────────────────
+        trace = tracer.finish()
+        payload["tool_trace"]  = trace
+        payload["html_report"] = generate_trinity_report_html(payload, tool_trace=trace)
+
+        return _ok(payload)
 
 # ─────────────────────────────────────────────────────────────
 _register_tool_def("get_similar_incident_history",

@@ -1,24 +1,13 @@
 """
 trinity_report.py
 =================
-
 Generates the Trinity incident HTML report from real Sentinel MCP data.
 
-Designed to be called from inside run_investigation_checklist() at the end
-of the invocation — reads the accumulated tool_trace and renders a
-wireframe-style report where every MCP tool call made during the
-investigation shows up as a row with inputs, outputs, status, and duration.
-
-  ╔═══════════════════════════════════════════════════════════════════╗
-  ║ SCOPE                                                             ║
-  ║                                                                   ║
-  ║ Single-agent POC. Only one real agent exists today: ODIN          ║
-  ║ (= run_investigation_checklist). The report keeps the Trinity     ║
-  ║ portal visual (header, summary, SLA, MITRE, IOCs, flow, timeline, ║
-  ║ notes) but the investigation evidence is a TRUE AUDIT TRAIL of    ║
-  ║ every tool call — la_query, enrich_ioc, query_cmdb — with real    ║
-  ║ inputs, outputs, durations. Reproducible, not decorative.         ║
-  ╚═══════════════════════════════════════════════════════════════════╝
+SIZE CAPS (to fit through chat-UI response limits):
+  - Trace table capped at 20 rows (all errors + slowest successes)
+  - Inputs truncated to 100 chars, outputs to 60 chars
+  - Odin "Communications" list capped at 4 entries
+Stats lines still reflect the FULL totals - nothing is hidden, just less verbose.
 """
 
 from __future__ import annotations
@@ -29,9 +18,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# ════════════════════════════════════════════════════════════════════════
-# CONSTANTS
-# ════════════════════════════════════════════════════════════════════════
+# ============ CAPS ============
+_TRACE_TABLE_MAX_ROWS   = 20
+_TRACE_INPUT_MAX_CHARS  = 100
+_TRACE_OUTPUT_MAX_CHARS = 60
+_ODIN_COMMS_MAX_ENTRIES = 4
+
 
 _SEVERITY_TO_P_LABEL = {
     "critical":      ("P1 Critical", "red"),
@@ -41,9 +33,7 @@ _SEVERITY_TO_P_LABEL = {
     "informational": ("P4 Low",      "green"),
 }
 
-_RISK_LEVEL_TO_SCORE = {
-    "Critical": 95, "High": 85, "Medium": 60, "Low": 30,
-}
+_RISK_LEVEL_TO_SCORE = {"Critical": 95, "High": 85, "Medium": 60, "Low": 30}
 
 _SLA_TARGETS_MIN = {
     "P1 Critical": {"detect": 15,  "contain": 30},
@@ -52,14 +42,10 @@ _SLA_TARGETS_MIN = {
     "P4 Low":      {"detect": 240, "contain": 1440},
 }
 
-_ODIN_TOOLS = [
-    "Sentinel KQL", "Defender XDR", "Entra Logs",
-    "CMDB", "VirusTotal", "AbuseIPDB",
-]
+_ODIN_TOOLS = ["Sentinel KQL", "Defender XDR", "Entra Logs",
+               "CMDB", "VirusTotal", "AbuseIPDB"]
 
-# Cost heuristic (POC): scale with the number of real tool calls + data volume
 _COST_PER_1K_TOKENS_USD = 0.013
-
 
 _MITRE_TECHNIQUE_NAMES = {
     "T1059": "Command and Scripting Interpreter",
@@ -95,10 +81,6 @@ _TACTIC_FOR_TECHNIQUE_PREFIX = {
 }
 
 
-# ════════════════════════════════════════════════════════════════════════
-# PUBLIC API
-# ════════════════════════════════════════════════════════════════════════
-
 def generate_trinity_report_html(
     checklist_result: dict,
     *,
@@ -106,16 +88,6 @@ def generate_trinity_report_html(
     classification: str = "CONFIDENTIAL",
     org_name: str = "Euronext Cybersecurity",
 ) -> str:
-    """
-    Render the Trinity HTML report from a run_investigation_checklist() payload.
-
-    checklist_result: the dict the tool was about to return (before _ok)
-    tool_trace:       list of {tool, status, input, output, duration_ms, t, error}
-                      dicts captured by tool_tracer.tracer during the run.
-                      If None, tries checklist_result["tool_trace"].
-
-    Returns HTML as a string. Never raises.
-    """
     try:
         if tool_trace is None:
             tool_trace = checklist_result.get("tool_trace") or []
@@ -124,14 +96,10 @@ def generate_trinity_report_html(
             classification=classification, org_name=org_name,
         )
         return _render_html(ctx)
-    except Exception as e:  # pragma: no cover — defensive
+    except Exception as e:
         return _render_error_html(str(e),
                                   classification=classification, org_name=org_name)
 
-
-# ════════════════════════════════════════════════════════════════════════
-# CONTEXT BUILDER
-# ════════════════════════════════════════════════════════════════════════
 
 def _build_report_context(checklist: dict, trace: List[dict],
                           *, classification: str, org_name: str) -> dict:
@@ -148,7 +116,6 @@ def _build_report_context(checklist: dict, trace: List[dict],
     cl_auto      = bool(checklist.get("checklist_auto"))
     surfaced_cmdb = checklist.get("surfaced_hosts_cmdb") or []
 
-    # Richer incident metadata, if the caller bundled investigate_incident() data
     incident_details = checklist.get("incident_details") or {}
     inc_meta = incident_details.get("incident") or {}
 
@@ -177,10 +144,8 @@ def _build_report_context(checklist: dict, trace: List[dict],
     iocs = _shape_iocs_for_table(ioc_enrich)
     sla_targets = _SLA_TARGETS_MIN.get(p_label, _SLA_TARGETS_MIN["P3 Medium"])
 
-    # ── Tool-call trace rows for the Investigation Findings table ─────
     trace_rows, trace_stats = _shape_trace_rows(trace)
 
-    # ── Odin state (the single real agent) ────────────────────────────
     odin = _build_odin_state(
         checklist=checklist, iocs=iocs, ioc_summary=ioc_summary,
         esc_triggers=esc_triggers, esc_fired=esc_fired,
@@ -241,43 +206,49 @@ def _build_report_context(checklist: dict, trace: List[dict],
     }
 
 
-# ════════════════════════════════════════════════════════════════════════
-# TOOL-TRACE → REPORT ROWS
-# ════════════════════════════════════════════════════════════════════════
-
 def _shape_trace_rows(trace: List[dict]) -> Tuple[List[dict], dict]:
     """
-    Normalize each trace event into a row dict ready for the HTML table,
-    and build aggregate stats (total calls, errors, total duration).
+    Normalize trace events into table rows + aggregate stats.
+    Cap rows at _TRACE_TABLE_MAX_ROWS (all errors + slowest successes).
+    Stats reflect ALL events so the summary line does not lie.
     """
-    rows: List[dict] = []
     total_ms = 0
     n_err = 0
     by_tool: Dict[str, int] = {}
 
-    for ev in trace or []:
-        if not isinstance(ev, dict):
-            continue
-        tool   = str(ev.get("tool") or "unknown")
-        status = str(ev.get("status") or "ok")
-        in_txt  = _truncate_str(ev.get("input") or "", 180)
-        out_txt = _truncate_str(ev.get("output") or "", 120)
-        dur_ms  = int(ev.get("duration_ms") or 0)
-        t       = str(ev.get("t") or "")
-        err     = ev.get("error")
+    events = [e for e in (trace or []) if isinstance(e, dict)]
 
-        rows.append({
-            "t": t, "tool": tool, "input": in_txt,
-            "output": out_txt, "status": status,
-            "duration_ms": dur_ms, "error": err,
-        })
-        total_ms += dur_ms
-        if status != "ok":
+    for ev in events:
+        total_ms += int(ev.get("duration_ms") or 0)
+        if str(ev.get("status") or "ok") != "ok":
             n_err += 1
+        tool = str(ev.get("tool") or "unknown")
         by_tool[tool] = by_tool.get(tool, 0) + 1
 
+    errors     = [e for e in events if str(e.get("status") or "ok") != "ok"]
+    successes  = [e for e in events if str(e.get("status") or "ok") == "ok"]
+    successes.sort(key=lambda e: -int(e.get("duration_ms") or 0))
+    budget     = max(0, _TRACE_TABLE_MAX_ROWS - len(errors))
+    selected   = errors + successes[:budget]
+
+    order = {id(e): i for i, e in enumerate(events)}
+    selected.sort(key=lambda e: order.get(id(e), 0))
+
+    rows: List[dict] = []
+    for ev in selected:
+        rows.append({
+            "t":           str(ev.get("t") or ""),
+            "tool":        str(ev.get("tool") or "unknown"),
+            "input":       _truncate_str(ev.get("input")  or "", _TRACE_INPUT_MAX_CHARS),
+            "output":      _truncate_str(ev.get("output") or "", _TRACE_OUTPUT_MAX_CHARS),
+            "status":      str(ev.get("status") or "ok"),
+            "duration_ms": int(ev.get("duration_ms") or 0),
+            "error":       ev.get("error"),
+        })
+
     stats = {
-        "n_calls":  len(rows),
+        "n_calls":  len(events),
+        "n_shown":  len(rows),
         "n_errors": n_err,
         "total_ms": total_ms,
         "by_tool":  by_tool,
@@ -285,18 +256,13 @@ def _shape_trace_rows(trace: List[dict]) -> Tuple[List[dict], dict]:
     return rows, stats
 
 
-# ════════════════════════════════════════════════════════════════════════
-# ODIN STATE
-# ════════════════════════════════════════════════════════════════════════
-
-def _build_odin_state(*, checklist: dict, iocs: List[dict], ioc_summary: dict,
-                      esc_triggers: list, esc_fired: bool,
-                      cl_used: str, cl_auto: bool,
-                      primary_host: str, primary_user: str, primary_ip: str,
-                      title: str, mitre_techniques: List[str],
-                      created_iso: Optional[str],
-                      entities: dict, surfaced_cmdb: list,
-                      trace: List[dict], trace_stats: dict) -> dict:
+def _build_odin_state(*, checklist, iocs, ioc_summary,
+                      esc_triggers, esc_fired,
+                      cl_used, cl_auto,
+                      primary_host, primary_user, primary_ip,
+                      title, mitre_techniques,
+                      created_iso, entities, surfaced_cmdb,
+                      trace, trace_stats) -> dict:
     confidence = _derive_confidence(iocs=iocs, esc_fired=esc_fired,
                                      mitre_count=len(mitre_techniques),
                                      trace_stats=trace_stats)
@@ -342,33 +308,31 @@ def _build_odin_state(*, checklist: dict, iocs: List[dict], ioc_summary: dict,
         if hosts_s:
             findings.append(("CMDB", f"Matched: {hosts_s}"))
 
-    # Communications — real tool-call arrows, deduped per provider/source
+    # Communications — capped at _ODIN_COMMS_MAX_ENTRIES
     base_dt = _parse_iso(created_iso) or datetime.now(timezone.utc)
     comms: List[Tuple[str, str, str]] = []
     comms.append((_fmt_dt_hms(base_dt, 0), "← Sentinel",
                   (title or "SecurityAlert")
                   + (f" on {primary_host}" if primary_host else "")))
 
-    # Pull up to 6 distinctive tool calls from the trace as communication events
-    for ev in (trace or [])[:20]:
+    for ev in (trace or [])[:12]:
         tool = str(ev.get("tool") or "")
         t    = str(ev.get("t") or "")
-        inp  = _truncate_str(str(ev.get("input") or ""), 90)
-        out  = _truncate_str(str(ev.get("output") or ""), 60)
+        inp  = _truncate_str(str(ev.get("input") or ""), 70)
+        out  = _truncate_str(str(ev.get("output") or ""), 50)
         if tool in ("enrich_ioc", "enrich_virustotal", "enrich_abuseipdb"):
             comms.append((t, "→ Threat Intel", f"{inp} → {out}"))
         elif tool == "query_cmdb":
             comms.append((t, "→ CMDB", f"{inp} → {out}"))
         elif tool == "la_query":
             comms.append((t, "→ Sentinel KQL", f"{inp} → {out}"))
-        if len(comms) >= 8:
+        if len(comms) >= _ODIN_COMMS_MAX_ENTRIES:
             break
 
     if esc_fired:
         comms.append((_fmt_dt_hms(base_dt, 45),
                       "→ Sentinel", "Escalation fired — threshold exceeded"))
 
-    # Tokens/cost heuristic (POC): real call count × real data volume
     tokens = 800 + n_calls * 200 + len(iocs) * 400
     cost_usd = round(tokens / 1000.0 * _COST_PER_1K_TOKENS_USD, 2)
 
@@ -424,10 +388,6 @@ def _derive_risk_level(ioc_summary: dict, esc_fired: bool) -> str:
     return "Low"
 
 
-# ════════════════════════════════════════════════════════════════════════
-# IOCs
-# ════════════════════════════════════════════════════════════════════════
-
 def _shape_iocs_for_table(ioc_enrichment: Dict[str, dict]) -> List[dict]:
     out: List[dict] = []
     for key, d in (ioc_enrichment or {}).items():
@@ -473,10 +433,6 @@ def _status_color(s: str) -> str:
             "exception": "#ef4444", "skipped": "#888"}.get(s, "#f59e0b")
 
 
-# ════════════════════════════════════════════════════════════════════════
-# MITRE
-# ════════════════════════════════════════════════════════════════════════
-
 def _pair_techniques_with_tactics(techniques, tactics):
     rows = []
     tactic_for = {}
@@ -493,10 +449,6 @@ def _pair_techniques_with_tactics(techniques, tactics):
         rows.append((tid_s, name, tac))
     return rows
 
-
-# ════════════════════════════════════════════════════════════════════════
-# TIMELINE + NOTES
-# ════════════════════════════════════════════════════════════════════════
 
 def _build_timeline(*, created_iso, cl_used, esc_fired, trace_stats) -> List[Tuple[str, str]]:
     base = _parse_iso(created_iso) or datetime.now(timezone.utc)
@@ -535,10 +487,6 @@ def _build_analyst_notes(*, owner, primary_user, risk_level, created_iso):
     bits.append(f"{risk_level} risk")
     return [(display, t, ". ".join(bits) + ".")]
 
-
-# ════════════════════════════════════════════════════════════════════════
-# HTML RENDERER
-# ════════════════════════════════════════════════════════════════════════
 
 _CSS = """*{margin:0;padding:0;box-sizing:border-box}
 :root{--red:#ef4444;--text-3:#888;--accent:#6C63FF}
@@ -617,7 +565,6 @@ def _render_html(ctx: dict) -> str:
       <div class="report-subtitle">{_h(meta["inc_id"])} • Generated {_h(meta["generated_ts"])} • Classification: {_h(meta["classification"])}</div>
     </div>""")
 
-    # Incident Summary
     parts.append('<div class="report-section"><div class="report-section-title">Incident Summary</div><div class="report-grid">')
     for label, val, extra in [
         ("Incident ID",    summ["inc_id"],        ""),
@@ -635,7 +582,6 @@ def _render_html(ctx: dict) -> str:
                      f'<div class="report-kv-val" {extra}>{_h(val)}</div></div>')
     parts.append('</div></div>')
 
-    # SLA
     detect_actual = f"{sla['detect_actual_min']}min" if sla["detect_actual_min"] is not None else "Unknown"
     parts.append(f"""
     <div class="report-section"><div class="report-section-title">SLA Performance</div>
@@ -646,7 +592,6 @@ def _render_html(ctx: dict) -> str:
       </div>
     </div>""")
 
-    # MITRE
     parts.append('<div class="report-section"><div class="report-section-title">MITRE ATT&amp;CK Techniques</div>'
                  '<table class="report-table"><thead><tr><th>ID</th><th>Technique</th><th>Tactic</th></tr></thead><tbody>')
     if ctx["mitre_rows"]:
@@ -656,7 +601,6 @@ def _render_html(ctx: dict) -> str:
         parts.append('<tr><td colspan="3" style="color:#999;font-style:italic">No MITRE techniques mapped.</td></tr>')
     parts.append('</tbody></table></div>')
 
-    # IOCs
     parts.append('<div class="report-section"><div class="report-section-title">Indicators of Compromise</div>'
                  '<table class="report-table"><thead><tr><th>Type</th><th>Value</th><th>Verdict</th><th>Source</th></tr></thead><tbody>')
     if ctx["iocs"]:
@@ -671,14 +615,17 @@ def _render_html(ctx: dict) -> str:
         parts.append('<tr><td colspan="4" style="color:#999;font-style:italic">No IOCs enriched.</td></tr>')
     parts.append('</tbody></table></div>')
 
-    # Investigation Findings — REAL TOOL-CALL TRACE
+    # Tool-call trace
     st = ctx["trace_stats"]
+    shown_note = ""
+    if st.get("n_shown") and st["n_shown"] < st["n_calls"]:
+        shown_note = f" — showing {st['n_shown']} (all errors + slowest)"
     parts.append(
         '<div class="report-section"><div class="report-section-title">Investigation Findings — Tool Call Trace</div>'
         f'<div style="font-size:11px;color:var(--text-3);margin-bottom:8px">'
         f'{st["n_calls"]} call{"s" if st["n_calls"] != 1 else ""}, '
         f'{st["n_errors"]} error{"s" if st["n_errors"] != 1 else ""}, '
-        f'total {st["total_ms"]/1000:.2f}s'
+        f'total {st["total_ms"]/1000:.2f}s{shown_note}'
         f'</div>'
         '<table class="report-table"><thead><tr>'
         '<th>Time</th><th>Tool</th><th>Input</th><th>Output</th><th>Status</th><th>Duration</th>'
@@ -712,7 +659,6 @@ def _render_html(ctx: dict) -> str:
         f'</div></div>'
     )
 
-    # Agent Decision Flow — Odin only
     parts.append(
         '<div class="report-section"><div class="report-section-title">Agent Decision Flow '
         '<span style="font-size:9px;font-weight:400;color:var(--text-3);text-transform:none;letter-spacing:0">— click to expand</span></div>'
@@ -721,14 +667,12 @@ def _render_html(ctx: dict) -> str:
     parts.append(_render_odin_node(odin, meta["inc_dom_id"]))
     parts.append('</div></div>')
 
-    # Timeline
     parts.append('<div class="report-section"><div class="report-section-title">Timeline</div>'
                  '<table class="report-table"><thead><tr><th>Time</th><th>Event</th></tr></thead><tbody>')
     for t, evt in ctx["timeline_rows"]:
         parts.append(f'<tr><td style="white-space:nowrap;font-variant-numeric:tabular-nums">{_h(t)}</td><td>{evt}</td></tr>')
     parts.append('</tbody></table></div>')
 
-    # Analyst Notes
     parts.append('<div class="report-section"><div class="report-section-title">Analyst Notes</div>'
                  '<table class="report-table"><thead><tr><th>Analyst</th><th>Time</th><th>Note</th></tr></thead><tbody>')
     if ctx["analyst_notes"]:
@@ -809,10 +753,6 @@ def _render_error_html(err: str, *, classification, org_name) -> str:
     )
 
 
-# ════════════════════════════════════════════════════════════════════════
-# UTILITIES
-# ════════════════════════════════════════════════════════════════════════
-
 def _h(val: Any) -> str:
     if val is None: return ""
     return _html.escape(str(val), quote=True)
@@ -866,15 +806,32 @@ def _fmt_dt_hms(dt: datetime, offset_s: int) -> str:
     return (dt + timedelta(seconds=offset_s)).strftime("%H:%M:%S")
 
 
-# ════════════════════════════════════════════════════════════════════════
-# __main__ — standalone demo
-# ════════════════════════════════════════════════════════════════════════
+# ============ STANDALONE DEMO ============
 
-def _demo_payload() -> dict:
+def _demo_payload_35_calls() -> dict:
+    """Synthetic payload mirroring a real 35-call, 6-error run."""
+    trace = []
+    for i in range(6):
+        trace.append({
+            "t": f"09:22:{30+i:02d}", "tool": "la_query",
+            "input":  f"SomeTable_{i} | where DeviceName contains 'ds800' | project TimeGenerated, DeviceName, AccountName, FileName | take 100",
+            "output": "", "status": "error", "duration_ms": 9000 + i * 200,
+            "error": "ARM request failed: 504 Gateway Timeout" if i % 2 else "Log Analytics: table not found",
+        })
+    for i in range(29):
+        trace.append({
+            "t": f"09:22:{40+i:02d}",
+            "tool": "la_query" if i % 3 else ("query_cmdb" if i % 5 == 0 else "enrich_ioc"),
+            "input":  "DeviceProcessEvents | where DeviceName contains 'ds800' and TimeGenerated > ago(12h) | project TimeGenerated, DeviceName, AccountName, FileName, ProcessCommandLine, SHA256 | take 100",
+            "output": f"{(i*7) % 50} rows" if i % 3 else "verdict=clean",
+            "status": "ok",
+            "duration_ms": 100 + (i * 173) % 3000,
+        })
+
     return {
         "incident_id":    1537667,
-        "incident_title": "Defender | A user was added to the local administrators group",
-        "checklist_used": "identity",
+        "incident_title": "Defender | ES Copenhagen | A user was added to the local administrators group",
+        "checklist_used": "default",
         "checklist_auto": True,
         "alerts_count":   2,
         "entities_extracted": {
@@ -884,63 +841,33 @@ def _demo_payload() -> dict:
         },
         "mitre": {"tactics": ["Resource Development"], "techniques": ["T1585"]},
         "ioc_enrichment": {},
-        "ioc_summary": {"malicious": 0, "suspicious": 0, "clean": 0, "unknown": 0},
+        "ioc_summary": {"malicious": 0},
         "escalation_triggers": [],
         "escalation_fired": False,
         "surfaced_hosts_cmdb": [
             {"host": "ds800.intern.vp.dk", "cmdb_rows": 1,
              "top": {"BusinessEntity": "ES Copenhagen", "PSNC": "PROD"}},
         ],
-        "checklist_coverage": {
-            "logon_events": "ok", "process_events": "ok",
-            "signin_logs": "ok", "entra_audit": "ok", "device_events": "empty",
-        },
+        "checklist_coverage": {"security_alerts_30d": "ok", "behavior_analytics": "error"},
         "incident_details": {
             "incident": {
                 "id": 1537667,
-                "title": "Defender | A user was added to the local administrators group",
-                "severity": "Medium", "status": "New",
+                "title": "Defender | ES Copenhagen | A user was added to the local administrators group",
+                "severity": "Medium", "status": "Closed",
                 "owner": "ana.rocha@euronext.com",
                 "created_time": "2026-04-21 09:22:24Z",
             },
             "timeline": {"first_alert": "2026-04-21 09:22:24Z"},
             "risk_level": "Medium",
         },
-        # ── the real tool trace ────────────────────────────────────────
-        "tool_trace": [
-            {"t": "09:22:25", "tool": "la_query",
-             "input":  "SecurityIncident | where IncidentNumber == toint('1537667') …",
-             "output": "1 row", "status": "ok", "duration_ms": 312},
-            {"t": "09:22:25", "tool": "la_query",
-             "input":  "SecurityAlert | where SystemAlertId in (…) …",
-             "output": "2 rows", "status": "ok", "duration_ms": 284},
-            {"t": "09:22:26", "tool": "la_query",
-             "input":  "DeviceLogonEvents | where DeviceName contains 'ds800' …",
-             "output": "12 rows", "status": "ok", "duration_ms": 418},
-            {"t": "09:22:26", "tool": "la_query",
-             "input":  "DeviceProcessEvents | where DeviceName contains 'ds800' …",
-             "output": "0 rows", "status": "ok", "duration_ms": 298},
-            {"t": "09:22:26", "tool": "la_query",
-             "input":  "SigninLogs | where UserPrincipalName == 'vp03da3' …",
-             "output": "4 rows", "status": "ok", "duration_ms": 356},
-            {"t": "09:22:27", "tool": "la_query",
-             "input":  "AuditLogs | where InitiatedBy.user.userPrincipalName == 'vp03da3' …",
-             "output": "2 rows", "status": "ok", "duration_ms": 201},
-            {"t": "09:22:27", "tool": "query_cmdb",
-             "input":  "ds800.intern.vp.dk",
-             "output": "1 row — ES Copenhagen / PROD", "status": "ok", "duration_ms": 145},
-            {"t": "09:22:28", "tool": "la_query",
-             "input":  "DeviceEvents | where DeviceName contains 'ds800' …",
-             "output": "timeout", "status": "error", "duration_ms": 10000,
-             "error": "ARM request failed: 504 Gateway Timeout"},
-        ],
+        "tool_trace": trace,
     }
 
 
 if __name__ == "__main__":
     import sys
     from pathlib import Path
-    html = generate_trinity_report_html(_demo_payload())
+    html = generate_trinity_report_html(_demo_payload_35_calls())
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("trinity_demo.html")
     out.write_text(html, encoding="utf-8")
-    print(f"OK — report written to {out}  ({len(html):,} bytes)")
+    print(f"OK - report written to {out} ({len(html):,} bytes)")

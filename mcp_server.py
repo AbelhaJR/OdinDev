@@ -3680,21 +3680,29 @@ def run_investigation_checklist(
 
         # ─── Finalize trace + render HTML report ──────────────────────
         # ─── Finalize trace + render HTML report ──────────────────────
+        # ─── Finalize trace + render HTML report ──────────────────────
         import base64 as _b64
         trace = tracer.finish()
         payload["tool_trace"] = trace
 
         html = generate_trinity_report_html(payload, tool_trace=trace)
-        payload["html_report"]        = html
-        payload["html_report_base64"] = _b64.b64encode(
-            html.encode("utf-8")
-        ).decode("ascii")
+        html_b64 = _b64.b64encode(html.encode("utf-8")).decode("ascii")
+
+        # Chunk the base64 so the agent can print each chunk in a separate
+        # code block without hitting single-message display caps.
+        # 4000 chars per chunk → safely under any known agent output cap.
+        CHUNK = 4000
+        chunks = [html_b64[i:i+CHUNK] for i in range(0, len(html_b64), CHUNK)]
+
         payload["html_report_bytes"]  = len(html)
+        payload["html_report_chunks"] = chunks
+        payload["html_report_total_chunks"] = len(chunks)
         payload["html_report_usage_note"] = (
-            "To view the report: copy html_report_base64, decode it with "
-            "`base64 -d` (macOS/Linux) or "
-            "`[IO.File]::WriteAllBytes('report.html',[Convert]::FromBase64String(...))` "
-            "(PowerShell), and open the resulting .html file in a browser."
+            f"The full Trinity HTML report is returned as a list of "
+            f"{len(chunks)} base64 chunks in html_report_chunks. "
+            f"Concatenate them in order (no separator), base64-decode the "
+            f"result, and save to a .html file. Each chunk is ≤{CHUNK} chars "
+            f"to fit well under chat-UI display limits."
         )
 
         return _ok(payload)

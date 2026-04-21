@@ -11,6 +11,7 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
+from trinity_report import generate_trinity_report
 
 # ============================================================
 # MCP SETUP
@@ -4178,6 +4179,32 @@ SecurityIncident
         "status_summary": status_summary,
         "incidents": incidents,
     })
+
+_register_tool_def("generate_trinity_report",
+    ("Generates the Trinity incident HTML report for a given Sentinel incident. "
+     "Internally orchestrates investigate_incident + run_investigation_checklist "
+     "and renders the multi-agent decision flow (Odin → Athena → parallel "
+     "Mimir/Heimdall/Frigg → Thor → Saga) onto the standard Trinity portal template. "
+     "\n\n"
+     "POC scope: real agent-to-agent delegation is NOT yet implemented. The report "
+     "narrates retrospectively — each agent section describes what that persona "
+     "would have produced given the real tool output. Inter-agent communications, "
+     "per-agent costs, and confidence scores are synthesized. All incident-level "
+     "fields (severity, entities, MITRE techniques, IOC verdicts from VT/AbuseIPDB, "
+     "SLA numbers, owner) are real."),
+    {"incident_id": "Sentinel incident number",
+     "timespan":    "ISO8601 duration, default P7D"})
+ 
+ 
+@mcp.tool
+def generate_trinity_report_tool(incident_id: str, timespan: str = "P7D") -> dict:
+    """Thin wrapper so the LLM client can invoke the tool by name."""
+    return generate_trinity_report(
+        incident_id, timespan,
+        investigate_incident_fn=investigate_incident,
+        run_checklist_fn=run_investigation_checklist,
+    )
+ 
 
 # ============================================================
 # EXPORT ASGI APP

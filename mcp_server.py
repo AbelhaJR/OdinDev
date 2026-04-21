@@ -11,7 +11,8 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
-from trinity_report import generate_trinity_report
+from tool_tracer import tracer, traced, summarize_kql
+from trinity_report import generate_trinity_report_html
 
 # ============================================================
 # MCP SETUP
@@ -4204,6 +4205,95 @@ def generate_trinity_report_tool(incident_id: str, timespan: str = "P7D") -> dic
         investigate_incident_fn=investigate_incident,
         run_checklist_fn=run_investigation_checklist,
     )
+
+
+@mcp.tool
+def run_investigation_checklist(incident_id: str,
+                                checklist: str = "auto",
+                                timespan: str = "P7D",
+                                compact: bool = False) -> dict:
+    with tracer.start("run_investigation_checklist"):
+        # ─── KEEP EVERYTHING YOUR FUNCTION ALREADY DOES HERE ──────────
+        # incident lookup, branch detection, parallel KQL tasks,
+        # bucket summaries, IOC enrichment, CMDB surfacing, etc.
+        # Only change: build the payload in a local var `payload`
+        # instead of calling `return _ok({...})` directly.
+ 
+        payload = {
+            "incident_id":          incident_id,
+            "incident_title":       incident_title,
+            "checklist_used":       cl,
+            "checklist_auto":       checklist == "auto",
+            "compact":              compact,
+            "site_detected":        site_detected,
+            "entities_extracted":   {
+                "hosts":        hosts,
+                "users":        users,
+                "ips":          ips,
+                "domains":      domains,
+                "primary_host": safe_host,
+                "primary_user": safe_user,
+                "primary_ip":   safe_ip,
+            },
+            "mitre":                {"tactics": tactics, "techniques": techniques},
+            "telemetry":            buckets,
+            "escalation_triggers":  escalation_triggers,
+            "escalation_fired":     bool(escalation_triggers),
+            "expanded_buckets":     expanded_buckets,
+            "surfaced_hosts":       surfaced_hosts,
+            "surfaced_hosts_cmdb":  surfaced_cmdb,
+            "ioc_enrichment":       ioc_enrichment,
+            "ioc_summary":          ioc_summary,
+            "checklist_coverage":   {
+                t["bucket"]: buckets.get(t["bucket"], {}).get("status", "missing")
+                for t in tasks
+            },
+            "similar_history_available": bool(hist_res.get("ok")),
+            "alerts_count":         len(alerts),
+        }
+ 
+        # ─── Attach full investigate_incident output so the report
+        #     has severity/owner/status/created_time. One extra call.
+        try:
+            inv_res = investigate_incident(incident_id, timespan)
+            if inv_res.get("ok"):
+                payload["incident_details"] = inv_res["data"]
+        except Exception:
+            pass  # report still renders without it
+ 
+        # ─── Tool-call trace + rendered HTML report ───────────────────
+        trace = tracer.finish()          # pops & returns the tool-call list
+        payload["tool_trace"]  = trace
+        payload["html_report"] = generate_trinity_report_html(payload,
+                                                               tool_trace=trace)
+ 
+        return _ok(payload)
+ 
+ 
+# ═══════════════════════════════════════════════════════════════════════
+# NOTE on ThreadPoolExecutor
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The existing `_run_queries_parallel()` and `_enrich_iocs_parallel()`
+# use their own thread pools. The tracer reads `tls.events` per thread,
+# so by default calls made in worker threads are NOT traced.
+#
+# If you want inner parallel la_query calls to appear in the report
+# (you do — that's most of the calls), make a small change in both
+# parallel helpers:
+#
+#   BEFORE:
+#       futures = {executor.submit(_run, task_id, kql): task_id
+#                  for task_id, _table, kql in tasks}
+#
+#   AFTER:
+#       from tool_tracer import run_in_pool_with_trace
+#       futures = {run_in_pool_with_trace(executor, _run, task_id, kql): task_id
+#                  for task_id, _table, kql in tasks}
+#
+# Same pattern in `_enrich_iocs_parallel`. Five extra lines total.
+# Without this, only the main-thread calls are traced.
+# ═════════════════════════════════════════════════════════════════
  
 
 # ============================================================

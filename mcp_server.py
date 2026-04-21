@@ -3679,9 +3679,23 @@ def run_investigation_checklist(
         }
 
         # ─── Finalize trace + render HTML report ──────────────────────
+        # ─── Finalize trace + render HTML report ──────────────────────
+        import base64 as _b64
         trace = tracer.finish()
-        payload["tool_trace"]  = trace
-        payload["html_report"] = generate_trinity_report_html(payload, tool_trace=trace)
+        payload["tool_trace"] = trace
+
+        html = generate_trinity_report_html(payload, tool_trace=trace)
+        payload["html_report"]        = html
+        payload["html_report_base64"] = _b64.b64encode(
+            html.encode("utf-8")
+        ).decode("ascii")
+        payload["html_report_bytes"]  = len(html)
+        payload["html_report_usage_note"] = (
+            "To view the report: copy html_report_base64, decode it with "
+            "`base64 -d` (macOS/Linux) or "
+            "`[IO.File]::WriteAllBytes('report.html',[Convert]::FromBase64String(...))` "
+            "(PowerShell), and open the resulting .html file in a browser."
+        )
 
         return _ok(payload)
 

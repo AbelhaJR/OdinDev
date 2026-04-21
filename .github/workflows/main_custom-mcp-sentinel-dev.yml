@@ -32,7 +32,8 @@ jobs:
           test -f function_app.py
           test -f host.json
           test -f mcp_server.py
-          test -f trinity_report.py          # ← added
+          test -f trinity_report.py
+          test -f tool_tracer.py
           test -f requirements.txt
           test -f workspace_tables.json
       - name: Create deployment package
@@ -42,6 +43,7 @@ jobs:
             host.json \
             mcp_server.py \
             trinity_report.py \
+            tool_tracer.py \
             requirements.txt \
             workspace_tables.json \
             .python_packages

@@ -596,12 +596,10 @@ def _query_cmdb_entity(value: str, timespan: str = "P90D") -> dict:
             return res2
 
     fallback_kql = f"""
+fallback_kql = f"""
 {CMDB_TABLE}
-| where tostring(*) contains "{safe_value}"
-| project
-    Key, Management_IP, ApplicationAndComponentInstance,
-    Network_Interfaces, Updated, Scanning_Information,
-    BusinessEntity, FQDN, PSNC, logsource
+| search "{safe_value}"
+| project TimeGenerated, Hostname=coalesce(Hostname_s, Computer), BusinessEntity, PSNC, logsource
 | take 20
 """.strip()
 

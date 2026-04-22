@@ -1,45 +1,56 @@
 """
-trinity_report.py
-=================
-Generates the Trinity incident HTML report from real Sentinel MCP data.
+trinity_report.py — v2
+======================
+Changes from v1 (manager feedback 2026-04-22):
 
-SIZE CAPS (to fit through chat-UI response limits):
-  - Trace table capped at 20 rows (all errors + slowest successes)
-  - Inputs truncated to 100 chars, outputs to 60 chars
-  - Odin "Communications" list capped at 4 entries
-Stats lines still reflect the FULL totals - nothing is hidden, just less verbose.
+  1. Incident ID: remove auto-inserted year. INC-1539814 not INC-2026-1539814.
+  2. Severity: use org labels (Critical/High/Medium/Low). No P1/P2/P3/P4.
+  3. Errors: render cleanly in the Tool Call Trace — extract {message, code,
+     status_code} instead of dumping raw Python dict repr.
+  4. IOCs: new "Links" column with clickable AbuseIPDB and/or VirusTotal
+     links when the enrichment included gui_link.
+  5. MITRE T1555 + T1555.* added to technique-name table.
+  6. Analyst Notes: robust parsing of owner field even when it's a
+     stringified dict like "{'assignedTo': 'user@corp'}".
+  7. New "Query Errors Summary" block shown only when errors > 0 — groups
+     errors by code so the manager can see at a glance what broke.
 """
 
 from __future__ import annotations
 
+import ast
 import html as _html
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# ============ CAPS ============
+# ── Size caps (to fit through chat-UI response limits) ─────────
 _TRACE_TABLE_MAX_ROWS   = 20
 _TRACE_INPUT_MAX_CHARS  = 100
 _TRACE_OUTPUT_MAX_CHARS = 60
 _ODIN_COMMS_MAX_ENTRIES = 4
 
 
-_SEVERITY_TO_P_LABEL = {
-    "critical":      ("P1 Critical", "red"),
-    "high":          ("P1 Critical", "red"),
-    "medium":        ("P2 High",     "orange"),
-    "low":           ("P3 Medium",   "blue"),
-    "informational": ("P4 Low",      "green"),
+# ── Severity → org label (Critical / High / Medium / Low) ─────
+#    Color is used only to flag the row red in the summary grid.
+_SEVERITY_MAP = {
+    "critical":      ("Critical",      True),
+    "high":          ("High",          True),
+    "medium":        ("Medium",        False),
+    "low":           ("Low",           False),
+    "informational": ("Informational", False),
 }
 
 _RISK_LEVEL_TO_SCORE = {"Critical": 95, "High": 85, "Medium": 60, "Low": 30}
 
+# SLA targets keyed by the new severity labels
 _SLA_TARGETS_MIN = {
-    "P1 Critical": {"detect": 15,  "contain": 30},
-    "P2 High":     {"detect": 30,  "contain": 120},
-    "P3 Medium":   {"detect": 60,  "contain": 480},
-    "P4 Low":      {"detect": 240, "contain": 1440},
+    "Critical":      {"detect": 15,  "contain": 30},
+    "High":          {"detect": 30,  "contain": 120},
+    "Medium":        {"detect": 60,  "contain": 480},
+    "Low":           {"detect": 240, "contain": 1440},
+    "Informational": {"detect": 240, "contain": 1440},
 }
 
 _ODIN_TOOLS = ["Sentinel KQL", "Defender XDR", "Entra Logs",
@@ -47,39 +58,79 @@ _ODIN_TOOLS = ["Sentinel KQL", "Defender XDR", "Entra Logs",
 
 _COST_PER_1K_TOKENS_USD = 0.013
 
+
+# ── MITRE technique names (expanded with common credential/persistence) ──
 _MITRE_TECHNIQUE_NAMES = {
+    "T1003": "OS Credential Dumping",
+    "T1003.001": "LSASS Memory",
+    "T1003.002": "Security Account Manager",
+    "T1021": "Remote Services",
+    "T1021.001": "Remote Desktop Protocol",
+    "T1021.002": "SMB/Windows Admin Shares",
+    "T1027": "Obfuscated Files or Information",
+    "T1047": "Windows Management Instrumentation",
     "T1059": "Command and Scripting Interpreter",
-    "T1059.001": "PowerShell", "T1059.003": "Windows Command Shell",
-    "T1027": "Obfuscated Files or Information", "T1140": "Deobfuscate/Decode Files",
-    "T1218": "Signed Binary Proxy Execution", "T1484": "Domain Policy Modification",
-    "T1132": "Data Encoding", "T1132.001": "Standard Encoding",
-    "T1071": "Application Layer Protocol", "T1071.001": "Web Protocols",
-    "T1105": "Ingress Tool Transfer", "T1003": "OS Credential Dumping",
-    "T1110": "Brute Force", "T1110.001": "Password Guessing",
-    "T1078": "Valid Accounts", "T1078.002": "Domain Accounts", "T1078.003": "Local Accounts",
-    "T1098": "Account Manipulation", "T1098.007": "Additional Local or Domain Groups",
-    "T1136": "Create Account", "T1136.001": "Local Account",
-    "T1548": "Abuse Elevation Control Mechanism",
+    "T1059.001": "PowerShell",
+    "T1059.003": "Windows Command Shell",
     "T1069": "Permission Groups Discovery",
-    "T1021": "Remote Services", "T1021.001": "Remote Desktop Protocol",
+    "T1071": "Application Layer Protocol",
+    "T1071.001": "Web Protocols",
+    "T1078": "Valid Accounts",
+    "T1078.002": "Domain Accounts",
+    "T1078.003": "Local Accounts",
+    "T1098": "Account Manipulation",
+    "T1098.007": "Additional Local or Domain Groups",
+    "T1105": "Ingress Tool Transfer",
+    "T1110": "Brute Force",
+    "T1110.001": "Password Guessing",
+    "T1132": "Data Encoding",
+    "T1132.001": "Standard Encoding",
+    "T1136": "Create Account",
+    "T1136.001": "Local Account",
+    "T1140": "Deobfuscate/Decode Files",
+    "T1218": "Signed Binary Proxy Execution",
+    "T1484": "Domain Policy Modification",
     "T1486": "Data Encrypted for Impact",
-    "T1566": "Phishing", "T1566.001": "Spearphishing Attachment",
-    "T1585": "Establish Accounts", "T1583": "Acquire Infrastructure",
+    "T1548": "Abuse Elevation Control Mechanism",
+    "T1555": "Credentials from Password Stores",
+    "T1555.003": "Credentials from Web Browsers",
+    "T1555.004": "Windows Credential Manager",
+    "T1555.005": "Password Managers",
+    "T1566": "Phishing",
+    "T1566.001": "Spearphishing Attachment",
+    "T1583": "Acquire Infrastructure",
+    "T1585": "Establish Accounts",
 }
 
 _TACTIC_FOR_TECHNIQUE_PREFIX = {
-    "T1059": "Execution", "T1027": "Defense Evasion", "T1140": "Defense Evasion",
-    "T1218": "Defense Evasion", "T1484": "Defense Evasion",
-    "T1132": "Command and Control", "T1071": "Command and Control",
-    "T1105": "Command and Control", "T1003": "Credential Access",
-    "T1110": "Credential Access", "T1078": "Defense Evasion",
-    "T1098": "Persistence", "T1136": "Persistence",
-    "T1548": "Privilege Escalation", "T1069": "Discovery",
-    "T1021": "Lateral Movement", "T1486": "Impact",
+    "T1003": "Credential Access",
+    "T1021": "Lateral Movement",
+    "T1027": "Defense Evasion",
+    "T1047": "Execution",
+    "T1059": "Execution",
+    "T1069": "Discovery",
+    "T1071": "Command and Control",
+    "T1078": "Defense Evasion",
+    "T1098": "Persistence",
+    "T1105": "Command and Control",
+    "T1110": "Credential Access",
+    "T1132": "Command and Control",
+    "T1136": "Persistence",
+    "T1140": "Defense Evasion",
+    "T1218": "Defense Evasion",
+    "T1484": "Defense Evasion",
+    "T1486": "Impact",
+    "T1548": "Privilege Escalation",
+    "T1555": "Credential Access",
     "T1566": "Initial Access",
-    "T1585": "Resource Development", "T1583": "Resource Development",
+    "T1583": "Resource Development",
+    "T1585": "Resource Development",
 }
 
+
+# ════════════════════════════════════════════════════════════════════════
+# PUBLIC API
+# ════════════════════════════════════════════════════════════════════════
 
 def generate_trinity_report_html(
     checklist_result: dict,
@@ -100,6 +151,10 @@ def generate_trinity_report_html(
         return _render_error_html(str(e),
                                   classification=classification, org_name=org_name)
 
+
+# ════════════════════════════════════════════════════════════════════════
+# CONTEXT
+# ════════════════════════════════════════════════════════════════════════
 
 def _build_report_context(checklist: dict, trace: List[dict],
                           *, classification: str, org_name: str) -> dict:
@@ -132,8 +187,8 @@ def _build_report_context(checklist: dict, trace: List[dict],
     primary_user = entities.get("primary_user") or _first(entities.get("users") or [])
     primary_ip   = entities.get("primary_ip")   or _first(entities.get("ips")   or [])
 
-    p_label, _sc = _SEVERITY_TO_P_LABEL.get(severity_raw.lower(),
-                                             ("P3 Medium", "blue"))
+    sev_label, sev_red = _SEVERITY_MAP.get(severity_raw.lower(),
+                                             ("Medium", False))
     risk_score = _RISK_LEVEL_TO_SCORE.get(risk_level, 60)
 
     techniques = [str(t) for t in (mitre.get("techniques") or [])]
@@ -142,9 +197,10 @@ def _build_report_context(checklist: dict, trace: List[dict],
     primary_technique = techniques[0] if techniques else ""
 
     iocs = _shape_iocs_for_table(ioc_enrich)
-    sla_targets = _SLA_TARGETS_MIN.get(p_label, _SLA_TARGETS_MIN["P3 Medium"])
+    sla_targets = _SLA_TARGETS_MIN.get(sev_label, _SLA_TARGETS_MIN["Medium"])
 
     trace_rows, trace_stats = _shape_trace_rows(trace)
+    error_summary = _summarise_errors(trace)
 
     odin = _build_odin_state(
         checklist=checklist, iocs=iocs, ioc_summary=ioc_summary,
@@ -181,7 +237,8 @@ def _build_report_context(checklist: dict, trace: List[dict],
         },
         "incident_summary": {
             "inc_id":         inc_id_display,
-            "p_label":        p_label,
+            "sev_label":      sev_label,
+            "sev_red":        sev_red,
             "status":         status,
             "detection_time": _fmt_iso_as_utc(created_iso),
             "source":         "Microsoft Sentinel",
@@ -200,18 +257,89 @@ def _build_report_context(checklist: dict, trace: List[dict],
         "iocs":          iocs,
         "trace_rows":    trace_rows,
         "trace_stats":   trace_stats,
+        "error_summary": error_summary,
         "odin":          odin,
         "timeline_rows": timeline_rows,
         "analyst_notes": analyst_notes,
     }
 
 
+# ════════════════════════════════════════════════════════════════════════
+# Error normalisation — extract clean {message, code, status_code}
+# ════════════════════════════════════════════════════════════════════════
+
+def _normalise_error(raw) -> Dict[str, Any]:
+    """
+    Take whatever the tool returned in its `error` field and produce a
+    clean dict with message / code / status_code fields. Handles:
+      - dict:  {"message": "...", "code": "...", "status_code": 400, ...}
+      - str:   "{'message': '...', 'code': '...'}" (stringified dict)
+      - plain: "Some error message"
+    """
+    if raw is None:
+        return {"message": "", "code": None, "status_code": None}
+
+    obj = raw
+    if isinstance(raw, str):
+        # Try to revive a stringified dict (fast path for Python repr)
+        txt = raw.strip()
+        if txt.startswith("{") and txt.endswith("}"):
+            try:
+                obj = ast.literal_eval(txt)
+            except Exception:
+                try:
+                    import json as _json
+                    obj = _json.loads(txt)
+                except Exception:
+                    obj = txt
+
+    if isinstance(obj, dict):
+        return {
+            "message":     str(obj.get("message") or "").strip() or "error",
+            "code":        obj.get("code"),
+            "status_code": obj.get("status_code"),
+        }
+    return {"message": str(obj).strip() or "error",
+            "code": None, "status_code": None}
+
+
+def _trace_event_error_line(ev: dict) -> str:
+    """Build a single-line human-readable error string for a trace row."""
+    err = _normalise_error(ev.get("error"))
+    parts = []
+    if err["status_code"] is not None:
+        parts.append(f"HTTP {err['status_code']}")
+    if err["code"]:
+        parts.append(err["code"])
+    parts.append(err["message"])
+    line = " · ".join(p for p in parts if p)
+    # Hard cap so even pathological responses can't blow up the row
+    return _truncate_str(line, 200)
+
+
+def _trace_event_output_for_table(ev: dict) -> str:
+    """
+    Build the 'Output' column value. For errors we replace the raw Python
+    dict dump with a terse status code, keeping the full message in the
+    error-line below.
+    """
+    status = str(ev.get("status") or "ok")
+    if status != "ok":
+        err = _normalise_error(ev.get("error"))
+        if err["status_code"] is not None:
+            return f"HTTP {err['status_code']}"
+        if err["code"]:
+            return str(err["code"])
+        return "error"
+    # OK result: use whatever output summary tool_tracer already computed
+    return _truncate_str(str(ev.get("output") or ""), _TRACE_OUTPUT_MAX_CHARS)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TOOL-TRACE → report rows
+# ════════════════════════════════════════════════════════════════════════
+
 def _shape_trace_rows(trace: List[dict]) -> Tuple[List[dict], dict]:
-    """
-    Normalize trace events into table rows + aggregate stats.
-    Cap rows at _TRACE_TABLE_MAX_ROWS (all errors + slowest successes).
-    Stats reflect ALL events so the summary line does not lie.
-    """
     total_ms = 0
     n_err = 0
     by_tool: Dict[str, int] = {}
@@ -236,14 +364,15 @@ def _shape_trace_rows(trace: List[dict]) -> Tuple[List[dict], dict]:
 
     rows: List[dict] = []
     for ev in selected:
+        status = str(ev.get("status") or "ok")
         rows.append({
             "t":           str(ev.get("t") or ""),
             "tool":        str(ev.get("tool") or "unknown"),
-            "input":       _truncate_str(ev.get("input")  or "", _TRACE_INPUT_MAX_CHARS),
-            "output":      _truncate_str(ev.get("output") or "", _TRACE_OUTPUT_MAX_CHARS),
-            "status":      str(ev.get("status") or "ok"),
+            "input":       _truncate_str(ev.get("input") or "", _TRACE_INPUT_MAX_CHARS),
+            "output":      _trace_event_output_for_table(ev),
+            "status":      status,
             "duration_ms": int(ev.get("duration_ms") or 0),
-            "error":       ev.get("error"),
+            "error_line":  _trace_event_error_line(ev) if status != "ok" else "",
         })
 
     stats = {
@@ -255,6 +384,46 @@ def _shape_trace_rows(trace: List[dict]) -> Tuple[List[dict], dict]:
     }
     return rows, stats
 
+
+def _summarise_errors(trace: List[dict]) -> List[dict]:
+    """
+    Group errors by (tool, code/status) and count. Lets us render a
+    compact summary block even when the full list is capped at 20 rows.
+    Returns [] when there are no errors.
+    """
+    groups: Dict[Tuple[str, str], int] = {}
+    samples: Dict[Tuple[str, str], str] = {}
+
+    for ev in trace or []:
+        if not isinstance(ev, dict):
+            continue
+        if str(ev.get("status") or "ok") == "ok":
+            continue
+        err = _normalise_error(ev.get("error"))
+        key_code = err["code"] or (
+            f"HTTP {err['status_code']}" if err["status_code"] else "error"
+        )
+        tool = str(ev.get("tool") or "unknown")
+        key = (tool, key_code)
+        groups[key] = groups.get(key, 0) + 1
+        if key not in samples:
+            samples[key] = err["message"] or key_code
+
+    out = []
+    for (tool, code), count in sorted(groups.items(),
+                                       key=lambda kv: -kv[1]):
+        out.append({
+            "tool":   tool,
+            "code":   code,
+            "count":  count,
+            "sample": _truncate_str(samples[(tool, code)], 160),
+        })
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════
+# ODIN STATE
+# ════════════════════════════════════════════════════════════════════════
 
 def _build_odin_state(*, checklist, iocs, ioc_summary,
                       esc_triggers, esc_fired,
@@ -308,7 +477,6 @@ def _build_odin_state(*, checklist, iocs, ioc_summary,
         if hosts_s:
             findings.append(("CMDB", f"Matched: {hosts_s}"))
 
-    # Communications — capped at _ODIN_COMMS_MAX_ENTRIES
     base_dt = _parse_iso(created_iso) or datetime.now(timezone.utc)
     comms: List[Tuple[str, str, str]] = []
     comms.append((_fmt_dt_hms(base_dt, 0), "← Sentinel",
@@ -388,6 +556,10 @@ def _derive_risk_level(ioc_summary: dict, esc_fired: bool) -> str:
     return "Low"
 
 
+# ════════════════════════════════════════════════════════════════════════
+# IOCs — now with AB/VT links
+# ════════════════════════════════════════════════════════════════════════
+
 def _shape_iocs_for_table(ioc_enrichment: Dict[str, dict]) -> List[dict]:
     out: List[dict] = []
     for key, d in (ioc_enrichment or {}).items():
@@ -402,10 +574,26 @@ def _shape_iocs_for_table(ioc_enrichment: Dict[str, dict]) -> List[dict]:
 
         display_value = _defang(str(key)) if ioc_type in ("domain", "url") else str(key)
 
+        vt = d.get("virustotal") if isinstance(d.get("virustotal"), dict) else {}
+        ab = d.get("abuseipdb")  if isinstance(d.get("abuseipdb"),  dict) else {}
+        vt_link = vt.get("gui_link") if isinstance(vt, dict) else None
+        ab_link = ab.get("gui_link") if isinstance(ab, dict) else None
+
+        # Score badges for the link column — only show if present/real
+        vt_mal = vt.get("malicious_engines") if isinstance(vt, dict) else None
+        ab_score = ab.get("abuse_confidence_score") if isinstance(ab, dict) else None
+
         out.append({
-            "value": key, "display_value": display_value,
-            "type": ioc_type, "type_label": type_label,
-            "verdict": verdict, "source": "Odin",
+            "value":         key,
+            "display_value": display_value,
+            "type":          ioc_type,
+            "type_label":    type_label,
+            "verdict":       verdict,
+            "source":        "Odin",
+            "vt_link":       vt_link,
+            "ab_link":       ab_link,
+            "vt_mal":        vt_mal,
+            "ab_score":      ab_score,
         })
 
     rank = {"malicious": 0, "suspicious": 1, "clean": 2, "unknown": 3}
@@ -433,6 +621,10 @@ def _status_color(s: str) -> str:
             "exception": "#ef4444", "skipped": "#888"}.get(s, "#f59e0b")
 
 
+# ════════════════════════════════════════════════════════════════════════
+# MITRE
+# ════════════════════════════════════════════════════════════════════════
+
 def _pair_techniques_with_tactics(techniques, tactics):
     rows = []
     tactic_for = {}
@@ -442,13 +634,18 @@ def _pair_techniques_with_tactics(techniques, tactics):
     for tid in techniques or []:
         tid_s = str(tid)
         name = (_MITRE_TECHNIQUE_NAMES.get(tid_s)
-                or _MITRE_TECHNIQUE_NAMES.get(tid_s.split(".")[0]) or tid_s)
+                or _MITRE_TECHNIQUE_NAMES.get(tid_s.split(".")[0])
+                or "—")   # ← use em-dash when unknown, don't echo the ID
         tac = (tactic_for.get(tid_s)
                or _TACTIC_FOR_TECHNIQUE_PREFIX.get(tid_s.split(".")[0])
                or (tactics[0] if tactics else "—"))
         rows.append((tid_s, name, tac))
     return rows
 
+
+# ════════════════════════════════════════════════════════════════════════
+# TIMELINE + NOTES
+# ════════════════════════════════════════════════════════════════════════
 
 def _build_timeline(*, created_iso, cl_used, esc_fired, trace_stats) -> List[Tuple[str, str]]:
     base = _parse_iso(created_iso) or datetime.now(timezone.utc)
@@ -468,25 +665,70 @@ def _build_timeline(*, created_iso, cl_used, esc_fired, trace_stats) -> List[Tup
     return rows
 
 
-def _build_analyst_notes(*, owner, primary_user, risk_level, created_iso):
-    if not owner: return []
-    name = ""
-    if isinstance(owner, dict):
-        name = (owner.get("assignedTo") or owner.get("email")
-                or owner.get("userPrincipalName") or "")
-    else:
-        name = str(owner)
-    if not name: return []
+def _parse_owner(owner: Any) -> str:
+    """
+    Extract a clean analyst name from the owner field, handling all the
+    shapes Sentinel may emit:
+      - dict:  {"assignedTo": "tc.user@euronext.com", "email": ..., ...}
+      - str:   "tc.user@euronext.com"
+      - str:   "{'assignedTo': 'tc.user@euronext.com', 'objectId': '...'}"
+      - None
+    Returns "" when no usable name can be extracted.
+    """
+    if owner in (None, ""):
+        return ""
 
-    parts = name.split("@")[0].replace(".", " ").split()
-    display = f"{parts[0][0].upper()}. {parts[-1].capitalize()}" if len(parts) >= 2 else name
+    obj = owner
+    if isinstance(owner, str):
+        txt = owner.strip()
+        if txt.startswith("{") and txt.endswith("}"):
+            try:
+                obj = ast.literal_eval(txt)
+            except Exception:
+                try:
+                    import json as _json
+                    obj = _json.loads(txt)
+                except Exception:
+                    obj = txt  # leave as string
+
+    if isinstance(obj, dict):
+        for k in ("assignedTo", "userPrincipalName", "email",
+                  "upn", "displayName", "name"):
+            v = obj.get(k)
+            if v and isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    return str(obj).strip()
+
+
+def _build_analyst_notes(*, owner, primary_user, risk_level, created_iso):
+    raw_name = _parse_owner(owner)
+    if not raw_name:
+        return []
+
+    # Pretty display: "tc.user@x.com" → "T. User", "alice.smith" → "A. Smith"
+    local = raw_name.split("@")[0]
+    parts = [p for p in local.replace("_", ".").split(".") if p]
+    if len(parts) >= 2:
+        display = f"{parts[0][0].upper()}. {parts[-1].capitalize()}"
+    elif parts:
+        display = parts[0].capitalize()
+    else:
+        display = raw_name
+
     base = _parse_iso(created_iso) or datetime.now(timezone.utc)
     t = (base + timedelta(seconds=55)).strftime("%H:%M")
     bits = []
-    if primary_user: bits.append(f"{primary_user} involved")
+    if primary_user:
+        bits.append(f"{primary_user} involved")
     bits.append(f"{risk_level} risk")
     return [(display, t, ". ".join(bits) + ".")]
 
+
+# ════════════════════════════════════════════════════════════════════════
+# HTML RENDERER
+# ════════════════════════════════════════════════════════════════════════
 
 _CSS = """*{margin:0;padding:0;box-sizing:border-box}
 :root{--red:#ef4444;--text-3:#888;--accent:#6C63FF}
@@ -539,7 +781,19 @@ body{font-family:'DM Sans','Inter',system-ui,sans-serif;background:#fff;color:#1
 .rf-cost span{color:#6C63FF;font-weight:600}
 .trace-tool{font-weight:600;color:#1a1a1a}
 .trace-pill{display:inline-block;font-size:9px;font-weight:700;padding:2px 6px;border-radius:4px;text-transform:uppercase;letter-spacing:0.3px}
-.trace-dur{color:#888;font-variant-numeric:tabular-nums}"""
+.trace-dur{color:#888;font-variant-numeric:tabular-nums}
+.ioc-link{display:inline-block;font-size:10px;font-weight:600;padding:2px 6px;margin-right:4px;border-radius:4px;text-decoration:none;border:1px solid #ddd}
+.ioc-link.vt{color:#394eff;border-color:#c7ccff}
+.ioc-link.ab{color:#c0392b;border-color:#f0c7c3}
+.ioc-link:hover{background:#f7f7f8}
+.err-summary{background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:10px 12px;margin-bottom:8px}
+.err-summary-title{font-size:10px;font-weight:700;color:#991b1b;text-transform:uppercase;letter-spacing:0.3px;margin-bottom:6px}
+.err-summary-row{font-size:11px;color:#7f1d1d;padding:3px 0;border-bottom:1px solid #fecaca;display:flex;gap:10px;align-items:baseline}
+.err-summary-row:last-child{border-bottom:none}
+.err-summary-count{font-weight:700;min-width:24px}
+.err-summary-tool{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;min-width:90px}
+.err-summary-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;min-width:140px}
+.err-summary-msg{color:#7f1d1d;flex:1}"""
 
 
 def _render_html(ctx: dict) -> str:
@@ -565,18 +819,20 @@ def _render_html(ctx: dict) -> str:
       <div class="report-subtitle">{_h(meta["inc_id"])} • Generated {_h(meta["generated_ts"])} • Classification: {_h(meta["classification"])}</div>
     </div>""")
 
+    # Incident Summary — severity uses org label Critical/High/Medium/Low
+    sev_style = 'style="color:var(--red)"' if summ["sev_red"] else ""
     parts.append('<div class="report-section"><div class="report-section-title">Incident Summary</div><div class="report-grid">')
     for label, val, extra in [
-        ("Incident ID",    summ["inc_id"],        ""),
-        ("Severity",       summ["p_label"],       'style="color:var(--red)"' if summ["p_label"].startswith("P1") else ""),
-        ("Status",         summ["status"],        ""),
+        ("Incident ID",    summ["inc_id"],         ""),
+        ("Severity",       summ["sev_label"],      sev_style),
+        ("Status",         summ["status"],         ""),
         ("Detection Time", summ["detection_time"], ""),
-        ("Source",         summ["source"],        ""),
+        ("Source",         summ["source"],         ""),
         ("Risk Score",     f"{summ['risk_score']}/100",
                            'style="color:var(--red)"' if summ["risk_score"] >= 80 else ""),
-        ("Affected Host",  summ["host"],          ""),
-        ("Affected User",  summ["user"],          ""),
-        ("MITRE ATT&CK",   summ["mitre_primary"], ""),
+        ("Affected Host",  summ["host"],           ""),
+        ("Affected User",  summ["user"],           ""),
+        ("MITRE ATT&CK",   summ["mitre_primary"],  ""),
     ]:
         parts.append(f'<div class="report-kv"><div class="report-kv-label">{_h(label)}</div>'
                      f'<div class="report-kv-val" {extra}>{_h(val)}</div></div>')
@@ -592,6 +848,7 @@ def _render_html(ctx: dict) -> str:
       </div>
     </div>""")
 
+    # MITRE
     parts.append('<div class="report-section"><div class="report-section-title">MITRE ATT&amp;CK Techniques</div>'
                  '<table class="report-table"><thead><tr><th>ID</th><th>Technique</th><th>Tactic</th></tr></thead><tbody>')
     if ctx["mitre_rows"]:
@@ -601,18 +858,34 @@ def _render_html(ctx: dict) -> str:
         parts.append('<tr><td colspan="3" style="color:#999;font-style:italic">No MITRE techniques mapped.</td></tr>')
     parts.append('</tbody></table></div>')
 
+    # IOCs — now with Links column
     parts.append('<div class="report-section"><div class="report-section-title">Indicators of Compromise</div>'
-                 '<table class="report-table"><thead><tr><th>Type</th><th>Value</th><th>Verdict</th><th>Source</th></tr></thead><tbody>')
+                 '<table class="report-table"><thead><tr><th>Type</th><th>Value</th><th>Verdict</th><th>Links</th><th>Source</th></tr></thead><tbody>')
     if ctx["iocs"]:
         for ioc in ctx["iocs"]:
+            links_html = []
+            if ioc.get("vt_link"):
+                score_txt = ""
+                if ioc.get("vt_mal") is not None:
+                    score_txt = f" ({ioc['vt_mal']})"
+                links_html.append(
+                    f'<a class="ioc-link vt" href="{_h(ioc["vt_link"])}" target="_blank" rel="noopener">VT{_h(score_txt)}</a>')
+            if ioc.get("ab_link"):
+                score_txt = ""
+                if ioc.get("ab_score") is not None:
+                    score_txt = f" ({ioc['ab_score']})"
+                links_html.append(
+                    f'<a class="ioc-link ab" href="{_h(ioc["ab_link"])}" target="_blank" rel="noopener">AbuseIPDB{_h(score_txt)}</a>')
+            links_cell = "".join(links_html) if links_html else '<span style="color:#bbb">—</span>'
             parts.append(
                 f'<tr><td>{_h(ioc["type_label"])}</td>'
                 f'<td class="mono">{_h(ioc["display_value"])}</td>'
                 f'<td><span style="color:{_verdict_color(ioc["verdict"])};font-weight:600">{_h(ioc["verdict"])}</span></td>'
+                f'<td>{links_cell}</td>'
                 f'<td>{_h(ioc["source"])}</td></tr>'
             )
     else:
-        parts.append('<tr><td colspan="4" style="color:#999;font-style:italic">No IOCs enriched.</td></tr>')
+        parts.append('<tr><td colspan="5" style="color:#999;font-style:italic">No IOCs enriched.</td></tr>')
     parts.append('</tbody></table></div>')
 
     # Tool-call trace
@@ -627,6 +900,23 @@ def _render_html(ctx: dict) -> str:
         f'{st["n_errors"]} error{"s" if st["n_errors"] != 1 else ""}, '
         f'total {st["total_ms"]/1000:.2f}s{shown_note}'
         f'</div>'
+    )
+
+    # Error summary block (shown only when errors > 0)
+    if ctx["error_summary"]:
+        parts.append('<div class="err-summary"><div class="err-summary-title">Query Error Summary</div>')
+        for g in ctx["error_summary"]:
+            parts.append(
+                '<div class="err-summary-row">'
+                f'<span class="err-summary-count">{g["count"]}×</span>'
+                f'<span class="err-summary-tool">{_h(g["tool"])}</span>'
+                f'<span class="err-summary-code">{_h(g["code"])}</span>'
+                f'<span class="err-summary-msg">{_h(g["sample"])}</span>'
+                '</div>'
+            )
+        parts.append('</div>')
+
+    parts.append(
         '<table class="report-table"><thead><tr>'
         '<th>Time</th><th>Tool</th><th>Input</th><th>Output</th><th>Status</th><th>Duration</th>'
         '</tr></thead><tbody>'
@@ -637,8 +927,8 @@ def _render_html(ctx: dict) -> str:
             dur = f"{r['duration_ms']}ms" if r['duration_ms'] < 1000 \
                   else f"{r['duration_ms']/1000:.2f}s"
             err_html = ""
-            if r["error"]:
-                err_html = f'<div style="font-size:10px;color:var(--red);margin-top:2px">{_h(r["error"])}</div>'
+            if r.get("error_line"):
+                err_html = f'<div style="font-size:10px;color:var(--red);margin-top:2px">{_h(r["error_line"])}</div>'
             parts.append(
                 '<tr>'
                 f'<td style="white-space:nowrap;font-variant-numeric:tabular-nums">{_h(r["t"])}</td>'
@@ -659,6 +949,7 @@ def _render_html(ctx: dict) -> str:
         f'</div></div>'
     )
 
+    # Agent Decision Flow
     parts.append(
         '<div class="report-section"><div class="report-section-title">Agent Decision Flow '
         '<span style="font-size:9px;font-weight:400;color:var(--text-3);text-transform:none;letter-spacing:0">— click to expand</span></div>'
@@ -667,12 +958,14 @@ def _render_html(ctx: dict) -> str:
     parts.append(_render_odin_node(odin, meta["inc_dom_id"]))
     parts.append('</div></div>')
 
+    # Timeline
     parts.append('<div class="report-section"><div class="report-section-title">Timeline</div>'
                  '<table class="report-table"><thead><tr><th>Time</th><th>Event</th></tr></thead><tbody>')
     for t, evt in ctx["timeline_rows"]:
         parts.append(f'<tr><td style="white-space:nowrap;font-variant-numeric:tabular-nums">{_h(t)}</td><td>{evt}</td></tr>')
     parts.append('</tbody></table></div>')
 
+    # Analyst Notes
     parts.append('<div class="report-section"><div class="report-section-title">Analyst Notes</div>'
                  '<table class="report-table"><thead><tr><th>Analyst</th><th>Time</th><th>Note</th></tr></thead><tbody>')
     if ctx["analyst_notes"]:
@@ -753,6 +1046,10 @@ def _render_error_html(err: str, *, classification, org_name) -> str:
     )
 
 
+# ════════════════════════════════════════════════════════════════════════
+# UTILITIES
+# ════════════════════════════════════════════════════════════════════════
+
 def _h(val: Any) -> str:
     if val is None: return ""
     return _html.escape(str(val), quote=True)
@@ -774,12 +1071,16 @@ def _slug_id(inc_id: str) -> str:
 
 
 def _format_incident_id(raw) -> str:
+    """
+    Keep incident IDs clean — NEVER insert a year.
+    INC-1539814  (not INC-2026-1539814)
+    If the caller already provided a formatted string, pass it through.
+    """
     if raw is None: return "INC-UNKNOWN"
-    s = str(raw)
+    s = str(raw).strip()
+    if not s: return "INC-UNKNOWN"
     if s.upper().startswith("INC-"): return s
-    if s.isdigit():
-        yr = datetime.now(timezone.utc).year
-        return f"INC-{yr}-{int(s):04d}"
+    if s.isdigit(): return f"INC-{s}"
     return s
 
 
@@ -806,59 +1107,90 @@ def _fmt_dt_hms(dt: datetime, offset_s: int) -> str:
     return (dt + timedelta(seconds=offset_s)).strftime("%H:%M:%S")
 
 
-# ============ STANDALONE DEMO ============
+# ════════════════════════════════════════════════════════════════════════
+# STANDALONE DEMO (mimics real 1539814 with T1555, 61 calls, 12 errors)
+# ════════════════════════════════════════════════════════════════════════
 
-def _demo_payload_35_calls() -> dict:
-    """Synthetic payload mirroring a real 35-call, 6-error run."""
+def _demo_payload_v2() -> dict:
     trace = []
-    for i in range(6):
+    # 12 errors — the real pattern: LOG_ANALYTICS_ERROR status 400 on bad CMDB query
+    for i in range(12):
         trace.append({
-            "t": f"09:22:{30+i:02d}", "tool": "la_query",
-            "input":  f"SomeTable_{i} | where DeviceName contains 'ds800' | project TimeGenerated, DeviceName, AccountName, FileName | take 100",
-            "output": "", "status": "error", "duration_ms": 9000 + i * 200,
-            "error": "ARM request failed: 504 Gateway Timeout" if i % 2 else "Log Analytics: table not found",
+            "t": f"12:15:{44+i:02d}", "tool": "la_query",
+            "input": 'COVERAGE_CMDB | where tostring(*) contains "10.100.118.11" | take 5',
+            "output": "",
+            "status": "error",
+            "duration_ms": 400 + (i * 50),
+            # Tool_tracer-style raw error — a stringified dict, what the live report actually gets
+            "error": ("{'message': 'Log Analytics query failed', 'code': 'LOG_ANALYTICS_ERROR', "
+                      "'status_code': 400, 'detail': '{\"error\":{\"message\":\"The request had some "
+                      "invalid properties\",\"code\":\"BadArgumentError\"}}'}"),
         })
-    for i in range(29):
+    # 49 successes
+    for i in range(49):
         trace.append({
-            "t": f"09:22:{40+i:02d}",
+            "t": f"12:16:{(i % 60):02d}",
             "tool": "la_query" if i % 3 else ("query_cmdb" if i % 5 == 0 else "enrich_ioc"),
-            "input":  "DeviceProcessEvents | where DeviceName contains 'ds800' and TimeGenerated > ago(12h) | project TimeGenerated, DeviceName, AccountName, FileName, ProcessCommandLine, SHA256 | take 100",
+            "input":  "DeviceLogonEvents | where DeviceName contains 'ds300' | project TimeGenerated, DeviceName, AccountName, LogonType | take 100",
             "output": f"{(i*7) % 50} rows" if i % 3 else "verdict=clean",
             "status": "ok",
-            "duration_ms": 100 + (i * 173) % 3000,
+            "duration_ms": 100 + (i * 173) % 2500,
         })
 
     return {
-        "incident_id":    1537667,
-        "incident_title": "Defender | ES Copenhagen | A user was added to the local administrators group",
-        "checklist_used": "default",
+        "incident_id":    1539814,
+        "incident_title": "Malicious request of Data Protection API (DPAPI) master key",
+        "checklist_used": "identity",
         "checklist_auto": True,
-        "alerts_count":   2,
+        "alerts_count":   3,
         "entities_extracted": {
-            "hosts": ["ds800.intern.vp.dk"], "users": ["vp03da3"],
-            "ips": [], "domains": [],
-            "primary_host": "ds800", "primary_user": "vp03da3", "primary_ip": "",
+            "hosts":   ["ds300.intern.corp"],
+            "users":   ["kevin.admin@euronext.com"],
+            "ips":     ["10.100.118.11", "193.162.11.20"],
+            "domains": [],
+            "primary_host": "ds300",
+            "primary_user": "kevin.admin@euronext.com",
+            "primary_ip":   "10.100.118.11",
         },
-        "mitre": {"tactics": ["Resource Development"], "techniques": ["T1585"]},
-        "ioc_enrichment": {},
-        "ioc_summary": {"malicious": 0},
+        "mitre": {"tactics": ["Credential Access"], "techniques": ["T1555"]},
+        "ioc_enrichment": {
+            "10.100.118.11": {
+                "ioc_type": "ip", "verdict": "clean",
+                "abuseipdb": {"provider": "abuseipdb", "status": "found",
+                              "abuse_confidence_score": 0, "country_code": "Reserved",
+                              "gui_link": "https://www.abuseipdb.com/check/10.100.118.11"},
+                "virustotal": {"provider": "virustotal", "status": "skipped"},
+            },
+            "193.162.11.20": {
+                "ioc_type": "ip", "verdict": "clean",
+                "abuseipdb": {"provider": "abuseipdb", "status": "found",
+                              "abuse_confidence_score": 0, "country_code": "NO",
+                              "gui_link": "https://www.abuseipdb.com/check/193.162.11.20"},
+                "virustotal": {"provider": "virustotal", "status": "skipped"},
+            },
+            "cdn-update.cloud": {
+                "ioc_type": "domain", "verdict": "malicious",
+                "virustotal": {"provider": "virustotal", "status": "found",
+                               "malicious_engines": 12, "suspicious_engines": 3,
+                               "gui_link": "https://www.virustotal.com/gui/domain/cdn-update.cloud"},
+            },
+        },
+        "ioc_summary": {"malicious": 1, "clean": 2, "suspicious": 0, "unknown": 0},
         "escalation_triggers": [],
         "escalation_fired": False,
-        "surfaced_hosts_cmdb": [
-            {"host": "ds800.intern.vp.dk", "cmdb_rows": 1,
-             "top": {"BusinessEntity": "ES Copenhagen", "PSNC": "PROD"}},
-        ],
-        "checklist_coverage": {"security_alerts_30d": "ok", "behavior_analytics": "error"},
+        "surfaced_hosts_cmdb": [{"host": "spsdseise00001v.oad.exch.int", "cmdb_rows": 1}],
         "incident_details": {
             "incident": {
-                "id": 1537667,
-                "title": "Defender | ES Copenhagen | A user was added to the local administrators group",
-                "severity": "Medium", "status": "Closed",
-                "owner": "ana.rocha@euronext.com",
-                "created_time": "2026-04-21 09:22:24Z",
+                "id": 1539814,
+                "title": "Malicious request of Data Protection API (DPAPI) master key",
+                # Test both dict-owner and string-owner shapes
+                "owner": "{'assignedTo': 'tc.user@euronext.com', 'email': 'tc.user@euronext.com', 'objectId': '1234'}",
+                "severity": "High",
+                "status": "Closed",
+                "created_time": "2026-04-22 07:13:43Z",
             },
-            "timeline": {"first_alert": "2026-04-21 09:22:24Z"},
-            "risk_level": "Medium",
+            "timeline": {"first_alert": "2026-04-22 07:13:43Z"},
+            "risk_level": "High",
         },
         "tool_trace": trace,
     }
@@ -867,7 +1199,7 @@ def _demo_payload_35_calls() -> dict:
 if __name__ == "__main__":
     import sys
     from pathlib import Path
-    html = generate_trinity_report_html(_demo_payload_35_calls())
-    out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("trinity_demo.html")
+    html = generate_trinity_report_html(_demo_payload_v2())
+    out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("trinity_v2_demo.html")
     out.write_text(html, encoding="utf-8")
-    print(f"OK - report written to {out} ({len(html):,} bytes)")
+    print(f"OK — report written to {out}  ({len(html):,} bytes)")

@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from typing import Any, Dict, List, Optional, Tuple
 from tool_tracer import tracer, traced, summarize_kql
 from trinity_report import generate_trinity_report_html
+import gzip as _gzip
+import base64 as _b64_mod
 
 # ============================================================
 # MCP SETUP
@@ -3681,28 +3683,29 @@ def run_investigation_checklist(
         # ─── Finalize trace + render HTML report ──────────────────────
         # ─── Finalize trace + render HTML report ──────────────────────
         # ─── Finalize trace + render HTML report ──────────────────────
-        import base64 as _b64
+        # ─── Finalize trace + render HTML report ──────────────────────
         trace = tracer.finish()
         payload["tool_trace"] = trace
 
         html = generate_trinity_report_html(payload, tool_trace=trace)
-        html_b64 = _b64.b64encode(html.encode("utf-8")).decode("ascii")
+        html_bytes = html.encode("utf-8")
 
-        # Chunk the base64 so the agent can print each chunk in a separate
-        # code block without hitting single-message display caps.
-        # 4000 chars per chunk → safely under any known agent output cap.
-        CHUNK = 4000
-        chunks = [html_b64[i:i+CHUNK] for i in range(0, len(html_b64), CHUNK)]
+        # Gzip first (typically 70-80% compression on our HTML due to
+        # repeated CSS + whitespace), then base64. Result is ~4-5x
+        # smaller than plain base64 → fits in a single agent response.
+        gz = _gzip.compress(html_bytes, compresslevel=9)
+        html_gz_b64 = _b64_mod.b64encode(gz).decode("ascii")
 
-        payload["html_report_bytes"]  = len(html)
-        payload["html_report_chunks"] = chunks
-        payload["html_report_total_chunks"] = len(chunks)
-        payload["html_report_usage_note"] = (
-            f"The full Trinity HTML report is returned as a list of "
-            f"{len(chunks)} base64 chunks in html_report_chunks. "
-            f"Concatenate them in order (no separator), base64-decode the "
-            f"result, and save to a .html file. Each chunk is ≤{CHUNK} chars "
-            f"to fit well under chat-UI display limits."
+        payload["html_report_bytes"]      = len(html)
+        payload["html_report_gz_b64"]     = html_gz_b64
+        payload["html_report_gz_b64_len"] = len(html_gz_b64)
+        payload["html_report_decode_hint"] = (
+            "Field html_report_gz_b64 is the full Trinity HTML report, "
+            "gzip-compressed, then base64-encoded. "
+            "To view: paste into a file as 'report.b64', then "
+            "`base64 -d report.b64 | gunzip > report.html` (bash), or "
+            "in PowerShell: decode base64 → GzipStream decompress → save as .html. "
+            "Size is ~4x smaller than raw base64 to fit in one chat message."
         )
 
         return _ok(payload)

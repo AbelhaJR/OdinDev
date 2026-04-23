@@ -99,7 +99,89 @@ MAX_HOURS_INCIDENT = 168
 # IOC ENRICHMENT CONFIGURATION
 # ============================================================
 
-ABUSEIPDB_API_KEY = os.environ.get("ABUSEIPDB_API_KEY", "")
+def _load_abuseipdb_api_keys() -> List[str]:
+    """
+    Load AbuseIPDB API keys from env, supporting:
+      ABUSEIPDB_API_KEYS=key1,key2,key3   (comma-separated)
+      ABUSEIPDB_API_KEY_1, _2, _3, ...    (numbered)
+      ABUSEIPDB_API_KEY                   (legacy single key)
+    Deduplicates while preserving order.
+    """
+    keys: List[str] = []
+    multi = os.environ.get("ABUSEIPDB_API_KEYS", "").strip()
+    if multi:
+        for k in multi.split(","):
+            k = k.strip()
+            if k and k not in keys:
+                keys.append(k)
+    for i in range(1, 11):
+        k = os.environ.get(f"ABUSEIPDB_API_KEY_{i}", "").strip()
+        if k and k not in keys:
+            keys.append(k)
+    legacy = os.environ.get("ABUSEIPDB_API_KEY", "").strip()
+    if legacy and legacy not in keys:
+        keys.append(legacy)
+    return keys
+
+
+_ABUSEIPDB_API_KEYS: List[str] = _load_abuseipdb_api_keys()
+
+# Per-key state for round-robin rotation + auto-skip on quota/auth errors
+_ABUSEIPDB_KEY_STATE: List[Dict[str, Any]] = [
+    {"key": k, "index": i, "last_call": 0.0, "cooldown_until": 0.0,
+     "calls": 0, "rate_limited": 0, "auth_failed": False}
+    for i, k in enumerate(_ABUSEIPDB_API_KEYS)
+]
+
+_ABUSEIPDB_POOL_LOCK = threading.Lock()
+
+
+def _abuseipdb_acquire_key(min_interval: float,
+                            max_wait: float = 5.0) -> Optional[Dict[str, Any]]:
+    """
+    Pick the next available key (round-robin, skipping any in cooldown
+    or marked auth-failed). Sleeps up to max_wait if all keys are
+    rate-limited but recovering soon. Returns None if every key is
+    permanently dead.
+    """
+    if not _ABUSEIPDB_KEY_STATE:
+        return None
+    with _ABUSEIPDB_POOL_LOCK:
+        alive = [s for s in _ABUSEIPDB_KEY_STATE if not s["auth_failed"]]
+        if not alive:
+            return None
+
+        def ready_at(s: Dict[str, Any]) -> float:
+            return max(s["last_call"] + min_interval, s["cooldown_until"])
+
+        best = min(alive, key=ready_at)
+        wait = ready_at(best) - time.time()
+        if wait > 0:
+            # Logic-App-friendly: cap the wait so we never block long
+            time.sleep(min(wait, max_wait))
+        best["last_call"] = time.time()
+        best["calls"] += 1
+        return best
+
+
+def _abuseipdb_mark_rate_limited(key_state: Dict[str, Any],
+                                   retry_after_sec: float = 60.0) -> None:
+    with _ABUSEIPDB_POOL_LOCK:
+        key_state["cooldown_until"] = time.time() + retry_after_sec
+        key_state["rate_limited"] += 1
+    logger.warning("AbuseIPDB key idx=%s rate-limited, cooldown=%.0fs",
+                   key_state.get("index"), retry_after_sec)
+
+
+def _abuseipdb_mark_auth_failed(key_state: Dict[str, Any]) -> None:
+    with _ABUSEIPDB_POOL_LOCK:
+        key_state["auth_failed"] = True
+    logger.error("AbuseIPDB key idx=%s permanently disabled (auth failed)",
+                 key_state.get("index"))
+
+
+# Backward-compat shim: some code paths still check this truthy
+ABUSEIPDB_API_KEY = _ABUSEIPDB_API_KEYS[0] if _ABUSEIPDB_API_KEYS else ""
 
 def _load_vt_api_keys() -> List[str]:
     keys: List[str] = []
@@ -1123,8 +1205,8 @@ def _enrich_virustotal(value: str, ioc_type: str) -> dict:
 
 
 def _enrich_abuseipdb(ip: str) -> dict:
-    if not ABUSEIPDB_API_KEY:
-        return {"ok": False, "error": "ABUSEIPDB_API_KEY not configured",
+    if not _ABUSEIPDB_API_KEYS:
+        return {"ok": False, "error": "No AbuseIPDB API keys configured",
                 "skipped": True}
 
     cache_key = f"abuseipdb:ip:{ip}"
@@ -1132,57 +1214,80 @@ def _enrich_abuseipdb(ip: str) -> dict:
     if cached is not None:
         return {"ok": True, "data": cached, "cached": True}
 
-    _ioc_rate_wait("abuseipdb", ABUSEIPDB_MIN_INTERVAL_SEC)
+    last_error = None
+    max_attempts = min(len(_ABUSEIPDB_API_KEYS), 3)
 
-    try:
-        resp = SESSION.get(
-            "https://api.abuseipdb.com/api/v2/check",
-            headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
-            params={"ipAddress": ip, "maxAgeInDays": "90", "verbose": ""},
-            timeout=IOC_HTTP_TIMEOUT,
-        )
-    except Exception as e:
-        return {"ok": False, "error": f"HTTP error: {e}"}
+    for attempt in range(max_attempts):
+        key_state = _abuseipdb_acquire_key(ABUSEIPDB_MIN_INTERVAL_SEC)
+        if not key_state:
+            return {"ok": False,
+                    "error": "All AbuseIPDB keys exhausted or auth-failed"}
 
-    if resp.status_code == 429:
-        return {"ok": False, "error": "AbuseIPDB rate limit hit (429)"}
+        try:
+            resp = SESSION.get(
+                "https://api.abuseipdb.com/api/v2/check",
+                headers={"Key": key_state["key"], "Accept": "application/json"},
+                params={"ipAddress": ip, "maxAgeInDays": "90", "verbose": ""},
+                timeout=IOC_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            last_error = f"HTTP error on key idx={key_state['index']}: {e}"
+            continue
 
-    if resp.status_code in (401, 403):
-        return {"ok": False, "error": "AbuseIPDB auth failed (check API key)"}
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                cooldown = float(retry_after) if retry_after else 60.0
+            except ValueError:
+                cooldown = 60.0
+            # AbuseIPDB free tier resets daily — bench until midnight if no Retry-After
+            if not retry_after:
+                cooldown = max(cooldown, 24 * 3600.0)
+            _abuseipdb_mark_rate_limited(key_state, cooldown)
+            last_error = f"429 on key idx={key_state['index']}, rotating"
+            continue
 
-    if not resp.ok:
-        return {"ok": False, "error": f"AbuseIPDB HTTP {resp.status_code}: {resp.text[:200]}"}
+        if resp.status_code in (401, 403):
+            _abuseipdb_mark_auth_failed(key_state)
+            last_error = f"auth failed on key idx={key_state['index']}, rotating"
+            continue
 
-    try:
-        d = (resp.json() or {}).get("data") or {}
-    except Exception as e:
-        return {"ok": False, "error": f"AbuseIPDB JSON parse error: {e}"}
+        if not resp.ok:
+            return {"ok": False,
+                    "error": f"AbuseIPDB HTTP {resp.status_code}: {resp.text[:200]}"}
 
-    score = int(d.get("abuseConfidenceScore") or 0)
-    result = {
-        "provider": "abuseipdb",
-        "ioc": ip,
-        "ioc_type": "ip",
-        "status": "found",
-        "abuse_confidence_score": score,
-        "total_reports":   d.get("totalReports"),
-        "num_distinct_users": d.get("numDistinctUsers"),
-        "last_reported_at": d.get("lastReportedAt"),
-        "country_code":    d.get("countryCode"),
-        "country_name":    d.get("countryName"),
-        "usage_type":      d.get("usageType"),
-        "isp":             d.get("isp"),
-        "domain":          d.get("domain"),
-        "is_tor":          d.get("isTor"),
-        "is_whitelisted":  d.get("isWhitelisted"),
-        "verdict":         ("malicious" if score >= ABUSEIPDB_SCORE_THRESHOLD
-                            else "suspicious" if score >= 25
-                            else "clean"),
-        "gui_link":        f"https://www.abuseipdb.com/check/{ip}",
-    }
+        try:
+            d = (resp.json() or {}).get("data") or {}
+        except Exception as e:
+            return {"ok": False, "error": f"AbuseIPDB JSON parse error: {e}"}
 
-    _ioc_cache_set(cache_key, result)
-    return {"ok": True, "data": result}
+        score = int(d.get("abuseConfidenceScore") or 0)
+        result = {
+            "provider": "abuseipdb",
+            "ioc": ip,
+            "ioc_type": "ip",
+            "status": "found",
+            "abuse_confidence_score": score,
+            "total_reports":   d.get("totalReports"),
+            "num_distinct_users": d.get("numDistinctUsers"),
+            "last_reported_at": d.get("lastReportedAt"),
+            "country_code":    d.get("countryCode"),
+            "country_name":    d.get("countryName"),
+            "usage_type":      d.get("usageType"),
+            "isp":             d.get("isp"),
+            "domain":          d.get("domain"),
+            "is_tor":          d.get("isTor"),
+            "is_whitelisted":  d.get("isWhitelisted"),
+            "verdict":         ("malicious" if score >= ABUSEIPDB_SCORE_THRESHOLD
+                                else "suspicious" if score >= 25
+                                else "clean"),
+            "gui_link":        f"https://www.abuseipdb.com/check/{ip}",
+        }
+
+        _ioc_cache_set(cache_key, result)
+        return {"ok": True, "data": result}
+
+    return {"ok": False, "error": last_error or "All AbuseIPDB keys exhausted"}
 
 
 def _enrich_ioc(value: str, value_type: Optional[str] = None) -> dict:
@@ -3588,7 +3693,7 @@ def run_investigation_checklist(
                 }
             return out
 
-        if ioc_list and (_VT_API_KEYS or ABUSEIPDB_API_KEY):
+        if ioc_list and (_VT_API_KEYS or _ABUSEIPDB_API_KEYS):
             enrichment_raw = _enrich_iocs_parallel(ioc_list, max_workers=4)
             for key, res in enrichment_raw.items():
                 if res.get("ok"):
@@ -3632,7 +3737,7 @@ def run_investigation_checklist(
                                  if isinstance(v, dict) and v.get("status") == "error"),
             "providers_enabled": {
                 "virustotal": bool(_VT_API_KEYS),
-                "abuseipdb":  bool(ABUSEIPDB_API_KEY),
+                "abuseipdb":  bool(_ABUSEIPDB_API_KEYS),
             },
             "routing": {
                 "ip":     "abuseipdb_only",
@@ -3829,6 +3934,29 @@ SecurityIncident
         "classification_summary": classification_summary,
         "status_summary": status_summary,
         "incidents": incidents,
+    })
+
+
+_register_tool_def("debug_abuseipdb_pool",
+    "Shows the current state of the AbuseIPDB key pool (key count, calls per key, rate-limit/auth state).",
+    {}, group="debug")
+
+@_expose("debug_abuseipdb_pool")
+def debug_abuseipdb_pool() -> dict:
+    now = time.time()
+    return _ok({
+        "pool_size": len(_ABUSEIPDB_KEY_STATE),
+        "keys": [
+            {
+                "index":          s["index"],
+                "calls":          s["calls"],
+                "rate_limited":   s["rate_limited"],
+                "auth_failed":    s["auth_failed"],
+                "in_cooldown":    s["cooldown_until"] > now,
+                "cooldown_remaining_sec": max(0, int(s["cooldown_until"] - now)),
+            }
+            for s in _ABUSEIPDB_KEY_STATE
+        ],
     })
 
 

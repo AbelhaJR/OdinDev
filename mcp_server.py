@@ -3941,7 +3941,7 @@ _register_tool_def("debug_abuseipdb_pool",
     "Shows the current state of the AbuseIPDB key pool (key count, calls per key, rate-limit/auth state).",
     {}, group="debug")
 
-@_expose("debug_abuseipdb_pool")
+@mcp.tool
 def debug_abuseipdb_pool() -> dict:
     now = time.time()
     return _ok({

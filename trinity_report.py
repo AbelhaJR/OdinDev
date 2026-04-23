@@ -201,6 +201,7 @@ def _build_report_context(checklist: dict, trace: List[dict],
 
     trace_rows, trace_stats = _shape_trace_rows(trace)
     error_summary = _summarise_errors(trace)
+    trace_clusters = _build_clusters(trace, ioc_summary)
 
     odin = _build_odin_state(
         checklist=checklist, iocs=iocs, ioc_summary=ioc_summary,
@@ -258,6 +259,7 @@ def _build_report_context(checklist: dict, trace: List[dict],
         "trace_rows":    trace_rows,
         "trace_stats":   trace_stats,
         "error_summary": error_summary,
+        "trace_clusters": trace_clusters,
         "odin":          odin,
         "timeline_rows": timeline_rows,
         "analyst_notes": analyst_notes,
@@ -383,6 +385,214 @@ def _shape_trace_rows(trace: List[dict]) -> Tuple[List[dict], dict]:
         "by_tool":  by_tool,
     }
     return rows, stats
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TRACE CLUSTERING — group tool calls into task-oriented buckets
+# so the Investigation Findings section reads as a wireframe of
+# purposeful work, not a flat call log.
+# ════════════════════════════════════════════════════════════════════════
+
+# Cluster IDs, titles, ordering and which tools/KQL patterns land in them.
+# Order matters — it's the display order in the report.
+_CLUSTER_DEFS: List[dict] = [
+    {
+        "id":    "incident",
+        "title": "Incident & Alert Enrichment",
+        "icon":  "🎯",
+        "desc":  "Fetch the triggering incident and correlated alerts.",
+    },
+    {
+        "id":    "cmdb",
+        "title": "CMDB Lookup",
+        "icon":  "🗂️",
+        "desc":  "Resolve affected hosts to their configuration items.",
+    },
+    {
+        "id":    "host",
+        "title": "Host Telemetry",
+        "icon":  "🖥️",
+        "desc":  "Logon, process, file, network and registry events on the affected hosts.",
+    },
+    {
+        "id":    "identity",
+        "title": "Identity Telemetry",
+        "icon":  "🔐",
+        "desc":  "Sign-ins, audit logs, directory changes and risk events for the affected users.",
+    },
+    {
+        "id":    "behavior",
+        "title": "Behavior Analytics",
+        "icon":  "📊",
+        "desc":  "UEBA baseline and anomaly scoring for the involved entities.",
+    },
+    {
+        "id":    "history",
+        "title": "Historical Context",
+        "icon":  "📚",
+        "desc":  "Similar incidents in the recent past for pattern recognition.",
+    },
+    {
+        "id":    "ioc",
+        "title": "IOC Enrichment",
+        "icon":  "🛰️",
+        "desc":  "External threat-intel lookup (VirusTotal, AbuseIPDB) for extracted indicators.",
+    },
+    {
+        "id":    "other",
+        "title": "Other Tool Calls",
+        "icon":  "⚙️",
+        "desc":  "Calls that did not fall into a specific investigation bucket.",
+    },
+]
+
+
+def _classify_trace_event(ev: dict) -> str:
+    """Assign a single trace event to a cluster id."""
+    tool = str(ev.get("tool") or "").lower()
+    inp  = str(ev.get("input") or "").lower()
+
+    if tool in ("enrich_ioc", "enrich_virustotal", "enrich_abuseipdb",
+                "virustotal", "abuseipdb"):
+        return "ioc"
+    if tool in ("query_cmdb", "cmdb_lookup", "cmdb"):
+        return "cmdb"
+    if tool != "la_query":
+        # Any unfamiliar tool name lands in "other"
+        return "other"
+
+    # la_query — classify by the KQL table referenced in the input
+    if any(k in inp for k in ("securityincident",)):
+        # Historical context if it's looking wide — 30d+
+        if any(h in inp for h in ("ago(30d)", "ago(14d)", "ago(90d)")):
+            return "history"
+        return "incident"
+    if "securityalert" in inp:
+        return "incident"
+    if any(k in inp for k in (
+        "devicelogonevents", "deviceprocessevents", "devicefileevents",
+        "devicenetworkevents", "deviceregistryevents", "deviceevents",
+        "deviceimageloadevents", "vmconnection", "heartbeat", "perf")):
+        return "host"
+    if any(k in inp for k in (
+        "signinlogs", "auditlogs", "aaduserriskevents", "aadriskyusers",
+        "identityinfo", "identitylogonevents", "identitydirectorychanges",
+        "identityqueryevents")):
+        return "identity"
+    if any(k in inp for k in ("behavioranalytics", "userpeeranalytics",
+                              "useraccessanalytics")):
+        return "behavior"
+    if "office" in inp and "activity" in inp:
+        return "identity"
+    if "coverage_cmdb" in inp or tool == "query_cmdb":
+        return "cmdb"
+    return "other"
+
+
+def _summarise_cluster_output(cluster_id: str, calls: List[dict],
+                               ioc_summary: dict) -> str:
+    """
+    Build a one-line human summary for the collapsed cluster header.
+    Uses real outputs from the calls — not placeholders.
+    """
+    if not calls:
+        return ""
+
+    # Special-case IOC cluster — pull from ioc_summary if we have it
+    if cluster_id == "ioc" and ioc_summary:
+        pieces = []
+        for v in ("malicious", "suspicious", "clean", "unknown"):
+            n = int(ioc_summary.get(v) or 0)
+            if n:
+                pieces.append(f"{n} {v}")
+        if pieces:
+            return ", ".join(pieces)
+
+    # Otherwise build from real outputs: sum row counts / capture verdicts
+    total_rows = 0
+    saw_rows   = False
+    verdicts: Dict[str, int] = {}
+    for c in calls:
+        out = str(c.get("output") or "").lower()
+        # Row counts like "12 rows", "100 rows", "1 row", "0 rows"
+        import re as _re
+        m = _re.search(r"(\d+)\s+rows?", out)
+        if m:
+            try:
+                total_rows += int(m.group(1))
+                saw_rows = True
+            except ValueError:
+                pass
+        # Verdicts like "verdict=clean" or "clean"/"malicious"/"suspicious"
+        for v in ("malicious", "suspicious", "clean", "unknown"):
+            if v in out:
+                verdicts[v] = verdicts.get(v, 0) + 1
+                break
+
+    if saw_rows and total_rows == 0:
+        return "0 rows (no hits)"
+    if saw_rows:
+        return f"{total_rows:,} row{'s' if total_rows != 1 else ''}"
+    if verdicts:
+        return ", ".join(f"{n} {v}" for v, n in sorted(verdicts.items()))
+    # Fallback: just count the calls
+    return f"{len(calls)} call{'s' if len(calls) != 1 else ''}"
+
+
+def _build_clusters(trace: List[dict], ioc_summary: dict) -> List[dict]:
+    """
+    Walk the trace once, group by cluster, and build a render-ready
+    list of dicts: each cluster has title, stats, a summary line and
+    its full list of call rows (for the expanded view).
+    """
+    buckets: Dict[str, List[dict]] = {cd["id"]: [] for cd in _CLUSTER_DEFS}
+
+    events = [e for e in (trace or []) if isinstance(e, dict)]
+    for ev in events:
+        cid = _classify_trace_event(ev)
+        if cid not in buckets:
+            cid = "other"
+        buckets[cid].append(ev)
+
+    out: List[dict] = []
+    for cdef in _CLUSTER_DEFS:
+        calls = buckets.get(cdef["id"], [])
+        if not calls:
+            continue
+
+        total_ms = sum(int(c.get("duration_ms") or 0) for c in calls)
+        n_err    = sum(1 for c in calls
+                        if str(c.get("status") or "ok") != "ok")
+
+        # Render-ready rows for the expanded detail table
+        rows = []
+        for ev in calls:
+            status = str(ev.get("status") or "ok")
+            rows.append({
+                "t":           str(ev.get("t") or ""),
+                "tool":        str(ev.get("tool") or "unknown"),
+                "input":       _truncate_str(ev.get("input")  or "", 240),
+                "output":      _trace_event_output_for_table(ev),
+                "status":      status,
+                "duration_ms": int(ev.get("duration_ms") or 0),
+                "error_line":  _trace_event_error_line(ev) if status != "ok" else "",
+            })
+
+        out.append({
+            "id":       cdef["id"],
+            "title":    cdef["title"],
+            "icon":     cdef["icon"],
+            "desc":     cdef["desc"],
+            "n_calls":  len(calls),
+            "n_errors": n_err,
+            "total_ms": total_ms,
+            "summary":  _summarise_cluster_output(cdef["id"], calls, ioc_summary),
+            "rows":     rows,
+            # Auto-open clusters that have errors — visibility over tidiness
+            "open":     n_err > 0,
+        })
+
+    return out
 
 
 def _summarise_errors(trace: List[dict]) -> List[dict]:
@@ -793,7 +1003,28 @@ body{font-family:'DM Sans','Inter',system-ui,sans-serif;background:#fff;color:#1
 .err-summary-count{font-weight:700;min-width:24px}
 .err-summary-tool{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;min-width:90px}
 .err-summary-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;min-width:140px}
-.err-summary-msg{color:#7f1d1d;flex:1}"""
+.err-summary-msg{color:#7f1d1d;flex:1}
+/* ── Wireframe clusters (Tool Call Trace) ───────────────────── */
+.wf{display:flex;flex-direction:column;gap:8px;margin-top:4px}
+.wf-cluster{border:1px solid #e0e0e0;border-radius:10px;background:#fff;overflow:hidden}
+.wf-cluster[open]{box-shadow:0 1px 0 rgba(0,0,0,0.02)}
+.wf-cluster.has-err{border-color:#fca5a5}
+.wf-head{list-style:none;cursor:pointer;padding:10px 14px;display:flex;align-items:center;gap:10px;user-select:none}
+.wf-head::-webkit-details-marker{display:none}
+.wf-chev{width:10px;color:#888;font-size:10px;transition:transform 0.15s ease;flex-shrink:0}
+.wf-cluster[open] .wf-chev{transform:rotate(90deg)}
+.wf-icon{font-size:14px;flex-shrink:0}
+.wf-title{font-size:12px;font-weight:700;color:#1a1a1a;flex:1}
+.wf-stats{display:flex;gap:6px;font-size:10px;font-weight:600;align-items:center;flex-shrink:0}
+.wf-stat{padding:2px 8px;border-radius:10px;background:#f0f0f0;color:#555;font-variant-numeric:tabular-nums}
+.wf-stat.err{background:#fee2e2;color:#991b1b}
+.wf-stat.ok{background:#dcfce7;color:#166534}
+.wf-summary{font-size:11px;color:#555;flex-shrink:0;padding-left:6px;border-left:1px solid #e0e0e0;margin-left:4px}
+.wf-body{border-top:1px solid #f0f0f0;padding:6px 0 2px 0;background:#fafafa}
+.wf-body .report-table{font-size:11.5px}
+.wf-body .report-table th{padding:6px 14px}
+.wf-body .report-table td{padding:6px 14px}
+.wf-desc{font-size:10px;color:#888;font-style:italic;padding:8px 14px 4px 14px}"""
 
 
 def _render_html(ctx: dict) -> str:
@@ -916,13 +1147,50 @@ def _render_html(ctx: dict) -> str:
             )
         parts.append('</div>')
 
-    parts.append(
-        '<table class="report-table"><thead><tr>'
-        '<th>Time</th><th>Tool</th><th>Input</th><th>Output</th><th>Status</th><th>Duration</th>'
-        '</tr></thead><tbody>'
-    )
-    if ctx["trace_rows"]:
-        for r in ctx["trace_rows"]:
+    # ── Wireframe: expandable clusters grouped by investigation task ─────
+    parts.append('<div class="wf">')
+    for cl in ctx.get("trace_clusters") or []:
+        has_err = cl["n_errors"] > 0
+        open_attr = " open" if cl["open"] else ""
+        cls_extra = " has-err" if has_err else ""
+
+        dur_str = (f"{cl['total_ms']/1000:.2f}s"
+                   if cl["total_ms"] >= 1000
+                   else f"{cl['total_ms']}ms")
+
+        stats_parts = [
+            f'<span class="wf-stat">{cl["n_calls"]} call'
+            f'{"s" if cl["n_calls"] != 1 else ""}</span>',
+            f'<span class="wf-stat">{dur_str}</span>',
+        ]
+        if has_err:
+            stats_parts.append(
+                f'<span class="wf-stat err">{cl["n_errors"]} error'
+                f'{"s" if cl["n_errors"] != 1 else ""}</span>')
+        else:
+            stats_parts.append('<span class="wf-stat ok">✓ ok</span>')
+        stats_html_str = "".join(stats_parts)
+
+        summary_html = ""
+        if cl.get("summary"):
+            summary_html = f'<span class="wf-summary">{_h(cl["summary"])}</span>'
+
+        parts.append(
+            f'<details class="wf-cluster{cls_extra}"{open_attr}>'
+            f'<summary class="wf-head">'
+            f'<span class="wf-chev">▶</span>'
+            f'<span class="wf-icon">{cl["icon"]}</span>'
+            f'<span class="wf-title">{_h(cl["title"])}</span>'
+            f'{summary_html}'
+            f'{stats_html_str}'
+            f'</summary>'
+            f'<div class="wf-body">'
+            f'<div class="wf-desc">{_h(cl["desc"])}</div>'
+            '<table class="report-table"><thead><tr>'
+            '<th>Time</th><th>Tool</th><th>Input</th><th>Output</th><th>Status</th><th>Duration</th>'
+            '</tr></thead><tbody>'
+        )
+        for r in cl["rows"]:
             sc = _status_color(r["status"])
             dur = f"{r['duration_ms']}ms" if r['duration_ms'] < 1000 \
                   else f"{r['duration_ms']/1000:.2f}s"
@@ -939,11 +1207,11 @@ def _render_html(ctx: dict) -> str:
                 f'<td class="trace-dur">{_h(dur)}</td>'
                 '</tr>'
             )
-    else:
-        parts.append('<tr><td colspan="6" style="color:#999;font-style:italic">No tool calls traced.</td></tr>')
-    parts.append('</tbody></table>')
+        parts.append('</tbody></table></div></details>')
+    parts.append('</div>')
+
     parts.append(
-        f'<div style="margin-top:10px;display:flex;justify-content:flex-end;gap:16px;font-size:12px;font-weight:600">'
+        f'<div style="margin-top:12px;display:flex;justify-content:flex-end;gap:16px;font-size:12px;font-weight:600">'
         f'<span style="color:var(--text-3)">Total AI Cost:</span>'
         f'<span style="color:var(--accent)">${odin["cost_usd"]:.2f} ({odin["tokens"]:,} tokens)</span>'
         f'</div></div>'
@@ -1111,31 +1379,115 @@ def _fmt_dt_hms(dt: datetime, offset_s: int) -> str:
 # STANDALONE DEMO (mimics real 1539814 with T1555, 61 calls, 12 errors)
 # ════════════════════════════════════════════════════════════════════════
 
-def _demo_payload_v2() -> dict:
+def _demo_payload_v3() -> dict:
+    """Mimics real 1539814 with T1555, 61 calls, 12 errors — exercises every cluster."""
     trace = []
-    # 12 errors — the real pattern: LOG_ANALYTICS_ERROR status 400 on bad CMDB query
+
+    # ── Incident & Alert Enrichment (2 successes) ────────────────────
+    trace.append({
+        "t": "12:15:40", "tool": "la_query",
+        "input": ('SecurityIncident | where IncidentNumber == toint("1539814") '
+                  'or tostring(IncidentName) =~ "1539814" | take 1'),
+        "output": "1 row", "status": "ok", "duration_ms": 312,
+    })
+    trace.append({
+        "t": "12:15:41", "tool": "la_query",
+        "input": "SecurityAlert | where SystemAlertId in (...) | take 50",
+        "output": "3 rows", "status": "ok", "duration_ms": 284,
+    })
+
+    # ── CMDB Lookup (1 success + 12 errors — the broken fallback) ────
+    trace.append({
+        "t": "12:15:42", "tool": "query_cmdb",
+        "input": "ds300.intern.corp",
+        "output": "1 row — ES Lisbon / Exchange PROD",
+        "status": "ok", "duration_ms": 145,
+    })
     for i in range(12):
         trace.append({
             "t": f"12:15:{44+i:02d}", "tool": "la_query",
-            "input": 'COVERAGE_CMDB | where tostring(*) contains "10.100.118.11" | take 5',
+            "input": f'COVERAGE_CMDB | where tostring(*) contains "10.100.{100+i}.11" | take 5',
             "output": "",
             "status": "error",
             "duration_ms": 400 + (i * 50),
-            # Tool_tracer-style raw error — a stringified dict, what the live report actually gets
             "error": ("{'message': 'Log Analytics query failed', 'code': 'LOG_ANALYTICS_ERROR', "
                       "'status_code': 400, 'detail': '{\"error\":{\"message\":\"The request had some "
                       "invalid properties\",\"code\":\"BadArgumentError\"}}'}"),
         })
-    # 49 successes
-    for i in range(49):
+
+    # ── Host Telemetry (8 successes, varying row counts) ─────────────
+    for i in range(8):
         trace.append({
-            "t": f"12:16:{(i % 60):02d}",
-            "tool": "la_query" if i % 3 else ("query_cmdb" if i % 5 == 0 else "enrich_ioc"),
-            "input":  "DeviceLogonEvents | where DeviceName contains 'ds300' | project TimeGenerated, DeviceName, AccountName, LogonType | take 100",
-            "output": f"{(i*7) % 50} rows" if i % 3 else "verdict=clean",
+            "t": f"12:16:{i:02d}",
+            "tool": "la_query",
+            "input": ("DeviceLogonEvents | where DeviceName contains 'ds300' | "
+                      "project TimeGenerated, DeviceName, AccountName, LogonType | take 100"
+                      if i < 3 else
+                      "DeviceProcessEvents | where DeviceName contains 'ds300' | "
+                      "project TimeGenerated, ProcessCommandLine, SHA256 | take 100"),
+            "output": f"{(i * 17) % 80} rows",
             "status": "ok",
-            "duration_ms": 100 + (i * 173) % 2500,
+            "duration_ms": 350 + (i * 120) % 900,
         })
+
+    # ── Identity Telemetry (15 successes — signins, audit, directory) ─
+    for i in range(15):
+        if i % 4 == 0:
+            tbl = "SigninLogs"
+        elif i % 4 == 1:
+            tbl = "AuditLogs"
+        elif i % 4 == 2:
+            tbl = "IdentityLogonEvents"
+        else:
+            tbl = "IdentityDirectoryEvents"
+        trace.append({
+            "t": f"12:16:{15+i:02d}",
+            "tool": "la_query",
+            "input": f"{tbl} | where UserPrincipalName == 'kevin.admin@euronext.com' | take 100",
+            "output": f"{(i * 7) % 60} rows" if i % 5 else "0 rows",
+            "status": "ok",
+            "duration_ms": 180 + (i * 93) % 700,
+        })
+
+    # ── Behavior Analytics (3 successes) ─────────────────────────────
+    for i in range(3):
+        trace.append({
+            "t": f"12:16:{35+i:02d}",
+            "tool": "la_query",
+            "input": "BehaviorAnalytics | where UsersInsights has 'kevin.admin' | take 100",
+            "output": "50 rows", "status": "ok", "duration_ms": 800 + i * 100,
+        })
+
+    # ── Historical Context (4 successes) ─────────────────────────────
+    for i in range(4):
+        trace.append({
+            "t": f"12:16:{40+i:02d}",
+            "tool": "la_query",
+            "input": ("SecurityIncident | where TimeGenerated > ago(30d) "
+                      "and Title has 'DPAPI master key' | take 20"),
+            "output": f"{6 - i} rows", "status": "ok", "duration_ms": 420 + i * 80,
+        })
+
+    # ── IOC Enrichment (5 successes) ─────────────────────────────────
+    ip_pool = ["10.100.118.11", "193.162.11.20", "54.77.131.39",
+               "93.71.65.34", "10.45.0.12"]
+    for i, ip in enumerate(ip_pool):
+        trace.append({
+            "t": f"12:16:{50+i:02d}",
+            "tool": "enrich_ioc",
+            "input": ip,
+            "output": "verdict=clean",
+            "status": "ok",
+            "duration_ms": 600 + (i * 280) % 2200,
+        })
+
+    # ── Other (1 misc call) ──────────────────────────────────────────
+    trace.append({
+        "t": "12:17:00", "tool": "get_incident_history",
+        "input": "incident_id=1539814",
+        "output": "5 related incidents",
+        "status": "ok", "duration_ms": 220,
+    })
 
     return {
         "incident_id":    1539814,
@@ -1146,7 +1498,7 @@ def _demo_payload_v2() -> dict:
         "entities_extracted": {
             "hosts":   ["ds300.intern.corp"],
             "users":   ["kevin.admin@euronext.com"],
-            "ips":     ["10.100.118.11", "193.162.11.20"],
+            "ips":     ip_pool,
             "domains": [],
             "primary_host": "ds300",
             "primary_user": "kevin.admin@euronext.com",
@@ -1156,34 +1508,33 @@ def _demo_payload_v2() -> dict:
         "ioc_enrichment": {
             "10.100.118.11": {
                 "ioc_type": "ip", "verdict": "clean",
-                "abuseipdb": {"provider": "abuseipdb", "status": "found",
-                              "abuse_confidence_score": 0, "country_code": "Reserved",
+                "abuseipdb": {"status": "found", "abuse_confidence_score": 0,
+                              "country_code": "Reserved",
                               "gui_link": "https://www.abuseipdb.com/check/10.100.118.11"},
-                "virustotal": {"provider": "virustotal", "status": "skipped"},
+                "virustotal": {"status": "skipped"},
             },
             "193.162.11.20": {
                 "ioc_type": "ip", "verdict": "clean",
-                "abuseipdb": {"provider": "abuseipdb", "status": "found",
-                              "abuse_confidence_score": 0, "country_code": "NO",
+                "abuseipdb": {"status": "found", "abuse_confidence_score": 0,
+                              "country_code": "NO",
                               "gui_link": "https://www.abuseipdb.com/check/193.162.11.20"},
-                "virustotal": {"provider": "virustotal", "status": "skipped"},
+                "virustotal": {"status": "skipped"},
             },
             "cdn-update.cloud": {
                 "ioc_type": "domain", "verdict": "malicious",
-                "virustotal": {"provider": "virustotal", "status": "found",
+                "virustotal": {"status": "found",
                                "malicious_engines": 12, "suspicious_engines": 3,
                                "gui_link": "https://www.virustotal.com/gui/domain/cdn-update.cloud"},
             },
         },
-        "ioc_summary": {"malicious": 1, "clean": 2, "suspicious": 0, "unknown": 0},
+        "ioc_summary": {"malicious": 1, "clean": 4, "suspicious": 0, "unknown": 0},
         "escalation_triggers": [],
         "escalation_fired": False,
-        "surfaced_hosts_cmdb": [{"host": "spsdseise00001v.oad.exch.int", "cmdb_rows": 1}],
+        "surfaced_hosts_cmdb": [{"host": "ds300.intern.corp", "cmdb_rows": 1}],
         "incident_details": {
             "incident": {
                 "id": 1539814,
                 "title": "Malicious request of Data Protection API (DPAPI) master key",
-                # Test both dict-owner and string-owner shapes
                 "owner": "{'assignedTo': 'tc.user@euronext.com', 'email': 'tc.user@euronext.com', 'objectId': '1234'}",
                 "severity": "High",
                 "status": "Closed",
@@ -1199,7 +1550,7 @@ def _demo_payload_v2() -> dict:
 if __name__ == "__main__":
     import sys
     from pathlib import Path
-    html = generate_trinity_report_html(_demo_payload_v2())
-    out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("trinity_v2_demo.html")
+    html = generate_trinity_report_html(_demo_payload_v3())
+    out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("trinity_v3_demo.html")
     out.write_text(html, encoding="utf-8")
     print(f"OK — report written to {out}  ({len(html):,} bytes)")
